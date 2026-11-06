@@ -15,6 +15,7 @@
 //
 // Every 2 s a STAT line goes to USB serial (see tools/serial_log.py).
 #include <M5Unified.h>
+#include <Wire.h>
 #include <esp_heap_caps.h>
 #include <lgfx/v1/panel/Panel_CO5300.hpp>  // Panel_AMOLED and its framebuffer (needs LGFX_USE_QSPI, set by M5GFX on ESP32-S3)
 
@@ -395,7 +396,36 @@ void diag_loop() {
 }
 #endif
 
+// Power the AMOLED off before M5.begin() powers it on again.
+//
+// A chip reset (esptool, or a serial port opened with DTR/RTS) leaves the panel powered, and
+// M5GFX's start-up only pulses its reset line for 8 ms. Several times after such a reset the
+// panel stayed black through every write path until the power button cycled everything; it
+// happened only with the direct-DMA renderer, which keeps a panel write in flight about a
+// fifth of the time. M5IOE1 (I2C 0x4F) register 0x05 holds the output levels of PYG1..8:
+// bit 7 = PYG8 L3B_EN (panel supply), bit 4 = PYG5 OLED_RST (see M5GFX stopwatch_power_on).
+// Returns the register value found, or -1 if the expander did not answer.
+int panel_power_cycle() {
+  constexpr uint8_t kIoe1 = 0x4F, kOutLevel = 0x05, kPanelPower = 0x80, kPanelReset = 0x10;
+  Wire.begin(47, 48, 100000);
+  Wire.beginTransmission(kIoe1);
+  Wire.write(kOutLevel);
+  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(kIoe1, (uint8_t)1) != 1) {
+    Wire.end();
+    return -1;
+  }
+  const uint8_t level = Wire.read();
+  Wire.beginTransmission(kIoe1);
+  Wire.write(kOutLevel);
+  Wire.write(level & ~(kPanelPower | kPanelReset));
+  Wire.endTransmission();
+  delay(200);
+  Wire.end();
+  return level;
+}
+
 void setup() {
+  const int ioe1_level = panel_power_cycle();
   auto cfg = M5.config();
   M5.begin(cfg);
   Serial.begin(115200);
@@ -442,6 +472,7 @@ void setup() {
   }
   g_out->fillScreen(TFT_BLACK);
 
+  Serial.printf("BOOT panel_power_cycle ioe1_out=%d\n", ioe1_level);
   Serial.printf("BOOT texture=%s\n", g_tex_tiled ? "psram_tile4" : "flash");
   Serial.printf("BOOT direct_panel=%d fb=%dx%d\n", g_direct_ok ? 1 : 0, (int)M5.Display.width(), (int)M5.Display.height());
   Serial.printf("BOOT board=%d display=%dx%d texture_bytes=%u expected=%u strip_lines=%d cpu_mhz=%u\n",
