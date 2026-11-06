@@ -103,4 +103,12 @@ the worst case drops from 223 to 127 cycles for 5% more at the equator.
 
 `data/earth_1024x512.rgb565be` is made by `tools/make_texture.py` from NASA's Blue Marble
 (Land Surface, Shallow Water, and Shaded Topography, 2002), public domain, taken as the 3840 px
-rendition of `File:Blue_Marble_2002.png` on Wikimedia Commons.
+rendition of `File:Blue_Marble_2002.png` on Wikimedia Commons (tagged PD-USGov-NASA there).
+Image credit: NASA Goddard Space Flight Center, Reto Stöckli (land surface, shallow water,
+clouds) and Robert Simmon (ocean colour, compositing), NASA Visible Earth.
+
+## Licence
+
+The code is under the MIT licence (`LICENSE`). The texture in `data/` is a work of NASA and in
+the public domain; the MIT licence does not apply to it.
+
