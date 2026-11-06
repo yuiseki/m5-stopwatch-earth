@@ -203,6 +203,57 @@ static void test_adaptive_single_pixel_rows() {
   }
 }
 
+static void test_quadratic_rows_stay_within_one_pixel() {
+  // The device default (seg 64, tol 0.25 px). Error is judged on screen: the texel distance
+  // from the exact renderer divided by the local squeeze (texels per pixel between exact
+  // neighbours, at least 1). Near the limb many texels share a pixel.
+  std::vector<uint32_t> tex(TW * TH);
+  for (uint32_t k = 0; k < tex.size(); ++k) tex[k] = k;
+  const int n = 468;
+  const Disc disc = Disc::make(n, n);
+  std::vector<uint32_t> a(n), b(n);
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+  std::vector<View> views = {View::make(89.5f * kDeg, 0.1f), View::make(-89.5f * kDeg, -3.0f), View::make(0, 0)};
+  for (int k = 0; k < 12; ++k) views.push_back(View::make(std::asin(2 * uni(rng) - 1), (2 * uni(rng) - 1) * kPi));
+  auto dist = [](uint32_t p, uint32_t q) {
+    int du = std::abs(int(p % TW) - int(q % TW));
+    if (du > TW / 2) du = TW - du;
+    const int dv = std::abs(int(p / TW) - int(q / TW));
+    return du > dv ? du : dv;
+  };
+  long px = 0, evals = 0;
+  float worst = 0;
+  for (const View& v : views)
+    for (int j = 0; j < n; ++j) {
+      int i0, i1;
+      if (!disc.row_span(j, n, &i0, &i1)) continue;
+      render_row<TW, TH>(v, disc, j, i0, i1, 1, 0, tex.data(), a.data());
+      evals += render_row_quadratic<TW, TH>(v, disc, j, i0, i1, 64, 0.25f, tex.data(), b.data());
+      for (int i = i0; i <= i1; ++i) {
+        ++px;
+        int sq = 1;
+        if (i > i0) sq = std::max(sq, dist(a[i], a[i - 1]));
+        if (i < i1) sq = std::max(sq, dist(a[i], a[i + 1]));
+        worst = std::max(worst, float(dist(a[i], b[i])) / float(sq));
+      }
+    }
+  CHECK(worst <= 1.0f, "quadratic rows drift %.2f pixels on screen", worst);
+  CHECK(evals * 5 < px, "quadratic rows evaluated %ld times for %ld pixels", evals, px);
+  std::printf("quadratic seg64 tol0.25px: worst %.2f px on screen, %.3f evals/px\n", worst, double(evals) / px);
+
+  // Rows one to three pixels wide, and nothing written past i1.
+  const View v = View::make(0.3f, 1.0f);
+  for (int w = 0; w < 3; ++w) {
+    std::fill(a.begin(), a.end(), 0xFFFFFFFFu);
+    std::fill(b.begin(), b.end(), 0xFFFFFFFFu);
+    render_row<TW, TH>(v, disc, 100, 200, 200 + w, 1, 0, tex.data(), a.data());
+    render_row_quadratic<TW, TH>(v, disc, 100, 200, 200 + w, 64, 0.25f, tex.data(), b.data());
+    for (int i = 200; i <= 200 + w; ++i) CHECK(a[i] == b[i], "width %d col %d", w + 1, i);
+    CHECK(b[201 + w] == 0xFFFFFFFFu, "wrote past i1 for width %d", w + 1);
+  }
+}
+
 int main() {
   test_atan2_accuracy();
   test_fast_scalar_ops();
@@ -214,6 +265,7 @@ int main() {
   test_row_span_matches_pixel_test();
   test_adaptive_rows_stay_within_one_texel();
   test_adaptive_single_pixel_rows();
+  test_quadratic_rows_stay_within_one_pixel();
   if (g_failures) {
     std::printf("%d failure(s)\n", g_failures);
     return 1;

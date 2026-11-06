@@ -45,6 +45,11 @@ constexpr int kStripLines = 16;
 // pixel (tools/interp_eval.cpp).
 constexpr int kSeg = 32;
 constexpr float kTol = 0.5f;
+// Quadratic rows (globe::render_row_quadratic): tol in screen pixels. seg 64 / tol 0.25 never
+// strays more than one pixel on screen and needs 0.157 exact evaluations per pixel.
+constexpr int kQuadSeg = 64;
+constexpr float kQuadTol = 0.25f;
+bool g_quadratic = true;
 constexpr int kButtonLeft = 2;  // KEYA, yellow
 constexpr int kButtonRight = 1; // KEYB, blue: toggles one or two rendering cores
 volatile bool g_right_edge = false;
@@ -95,7 +100,11 @@ void IRAM_ATTR render_rows(const globe::View& v, int y0, int r0, int r1, uint16_
     }
     if (i0 > 0) memset(row, 0, i0 * 2);
     if (i1 < g_w - 1) memset(row + i1 + 1, 0, (g_w - 1 - i1) * 2);
-    globe::render_row_adaptive<TW, TH>(v, g_disc, j, i0, i1, kSeg, kTol, g_tex, row);
+    if (g_quadratic) {
+      globe::render_row_quadratic<TW, TH>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, g_tex, row);
+    } else {
+      globe::render_row_adaptive<TW, TH>(v, g_disc, j, i0, i1, kSeg, kTol, g_tex, row);
+    }
   }
 }
 
@@ -178,6 +187,8 @@ void IRAM_ATTR bench_pass(const globe::View& v, const uint16_t* tex, int seg, ui
     if (!g_disc.row_span(j, g_w, &i0, &i1)) continue;
     if (seg <= 1) {
       globe::render_row<TW, TH>(v, g_disc, j, i0, i1, 1, 0.0f, tex, rowbuf);
+    } else if (seg == kQuadSeg) {
+      globe::render_row_quadratic<TW, TH>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, tex, rowbuf);
     } else {
       globe::render_row_adaptive<TW, TH>(v, g_disc, j, i0, i1, seg, kTol, tex, rowbuf);
     }
@@ -202,7 +213,8 @@ void run_bench() {
     const uint16_t* tex;
     int seg;
   } variants[] = {{"exact_flash", g_tex, 1}, {"exact_psram", psram_tex, 1}, {"adaptive_flash", g_tex, kSeg},
-                  {"adaptive_psram", psram_tex, kSeg}};
+                  {"adaptive_psram", psram_tex, kSeg},
+                  {"quadratic_flash", g_tex, kQuadSeg}, {"quadratic_psram", psram_tex, kQuadSeg}};
   for (auto& var : variants) {
     if (var.tex == nullptr) continue;
     uint32_t sum, us;

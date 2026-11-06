@@ -62,6 +62,18 @@ inline float fast_recip(float x) {
   return y;
 }
 
+// 1/x for x > 0 with two Newton steps: relative error about 2e-4. Enough for the ratio fed to
+// atan (an angle error of about 2e-4 rad, 0.03 texel on a 1024-wide texture).
+inline float fast_recip2(float x) {
+  FloatBits b;
+  b.f = x;
+  b.u = 0x7ef311c7u - b.u;
+  float y = b.f;
+  y = y * (2.0f - x * y);
+  y = y * (2.0f - x * y);
+  return y;
+}
+
 // floor(x) for |x| < 2^31.
 inline int fast_floor(float x) {
   const int i = static_cast<int>(x);
@@ -83,7 +95,7 @@ inline float fast_atan2(float y, float x) {
   const float mx = ax > ay ? ax : ay;
   const float mn = ax > ay ? ay : ax;
   if (mx == 0.0f) return 0.0f;
-  float a = atan01(mn * fast_recip(mx));
+  float a = atan01(mn * fast_recip2(mx));
   if (ay > ax) a = 0.5f * kPi - a;
   if (x < 0.0f) a = kPi - a;
   return y < 0.0f ? -a : a;
@@ -299,6 +311,119 @@ inline int render_row_adaptive(const View& v, const Disc& d, int j, int i0, int 
       } else {
         stack[sp++] = Job{m, job.b, pm, job.q};
         stack[sp++] = Job{job.a, m, job.p, pm};
+      }
+    }
+    pa = pb;
+    a = b;
+  }
+  put(i1, pa);
+  return evals;
+}
+
+// One row by adaptive quadratic interpolation, pixels [i0, i1] of row j, into row[i0..i1].
+//
+// Along a row, v bends quadratically in x even at the disc centre, so straight-line pieces
+// must stay short. Here each segment of `seg` pixels gets a parabola through the exact values
+// at its ends and midpoint, checked against exact values at the quarter points. If both are
+// within `tol` texels the segment is filled by forward differences (two adds per coordinate per
+// pixel); otherwise it is halved, and the quarter points become the halves' midpoints, so no
+// exact evaluation is wasted. Segments of 4 pixels or fewer are computed exactly.
+//
+// `tol` is measured on screen. Where the texture is squeezed (more than one texel per pixel,
+// towards the limb, where the mapping's slope diverges and no polynomial fits) the allowed
+// texel error grows with the squeeze: one pixel there covers that many texels, and nearest
+// sampling picks any of them equally well. Without this the limb took two thirds of the exact
+// evaluations of a row.
+//
+// Returns the number of exact evaluations.
+template <int TW, int TH, typename Pixel>
+inline int render_row_quadratic(const View& v, const Disc& d, int j, int i0, int i1, int seg, float tol,
+                                const Pixel* tex, Pixel* row) {
+  const float py = (d.cy - (static_cast<float>(j) + 0.5f)) * d.inv_r;
+  const float py2 = py * py;
+  int evals = 0;
+  struct UV {
+    float u, v;
+  };
+  auto exact = [&](int i) {
+    const float px = (static_cast<float>(i) + 0.5f - d.cx) * d.inv_r;
+    float rem = 1.0f - px * px - py2;
+    if (rem < 0.0f) rem = 0.0f;  // span edge rounding
+    UV r;
+    view_to_uv<TW, TH>(v, px, py, fast_sqrt(rem), &r.u, &r.v);
+    ++evals;
+    return r;
+  };
+  auto wrap = [](float du) {
+    if (du > 0.5f * TW) du -= TW;
+    if (du < -0.5f * TW) du += TW;
+    return du;
+  };
+  auto put = [&](int i, const UV& p) { row[i] = tex[latlon_texel_from_uv<TW, TH>(p.u, p.v)]; };
+  struct Job {
+    int a, b;    // fills [a, b); exact values known at a, b and m = (a + b) / 2
+    UV pa, pb, pm;
+  };
+  Job stack[24];
+  UV pa = exact(i0);
+  for (int a = i0; a < i1;) {
+    const int b = (a + seg < i1) ? a + seg : i1;
+    const UV pb = exact(b);
+    const UV pm0 = (b - a >= 2) ? exact((a + b) / 2) : pb;
+    int sp = 0;
+    stack[sp++] = Job{a, b, pa, pb, pm0};
+    while (sp) {
+      const Job jb = stack[--sp];
+      const int n = jb.b - jb.a;
+      const int m = (jb.a + jb.b) / 2;
+      if (n <= 4) {
+        put(jb.a, jb.pa);
+        for (int i = jb.a + 1; i < jb.b; ++i) put(i, i == m ? jb.pm : exact(i));
+        continue;
+      }
+      const int q1 = (jb.a + m) / 2, q3 = (m + jb.b) / 2;
+      const UV p1 = exact(q1), p3 = exact(q3);
+      // Parabola f(t) = c1 t + c2 t^2 relative to pa, t = i - a, through m and b.
+      const float tm = static_cast<float>(m - jb.a), tb = static_cast<float>(n);
+      const float inv_tm = fast_recip(tm), inv_tb = fast_recip(tb), inv_d = fast_recip(tb - tm);
+      const float dmu = wrap(jb.pm.u - jb.pa.u), dbu = wrap(jb.pb.u - jb.pa.u);
+      const float dmv = jb.pm.v - jb.pa.v, dbv = jb.pb.v - jb.pa.v;
+      const float c2u = (dbu * inv_tb - dmu * inv_tm) * inv_d, c1u = dmu * inv_tm - c2u * tm;
+      const float c2v = (dbv * inv_tb - dmv * inv_tm) * inv_d, c1v = dmv * inv_tm - c2v * tm;
+      // tol is in screen pixels: where the segment squeezes `scale` texels into each pixel
+      // (towards the limb), an error of tol * scale texels is still tol pixels on screen.
+      float scale = std::fabs(dbu) * inv_tb;
+      const float scale_v = std::fabs(dbv) * inv_tb;
+      if (scale_v > scale) scale = scale_v;
+      if (scale < 1.0f) scale = 1.0f;
+      const float tol_t = tol * scale;
+      auto ok = [&](int i, const UV& e) {
+        const float t = static_cast<float>(i - jb.a);
+        const float fu = (c1u + c2u * t) * t, fv = (c1v + c2v * t) * t;
+        return std::fabs(wrap(e.u - jb.pa.u) - fu) <= tol_t && std::fabs((e.v - jb.pa.v) - fv) <= tol_t;
+      };
+      if (ok(q1, p1) && ok(q3, p3)) {
+        // Forward differences in 16.16: value, first difference, constant second difference.
+        int32_t U = static_cast<int32_t>(jb.pa.u * 65536.0f);
+        int32_t V = static_cast<int32_t>(jb.pa.v * 65536.0f);
+        int32_t dU = static_cast<int32_t>((c1u + c2u) * 65536.0f);
+        int32_t dV = static_cast<int32_t>((c1v + c2v) * 65536.0f);
+        const int32_t ddU = static_cast<int32_t>(2.0f * c2u * 65536.0f);
+        const int32_t ddV = static_cast<int32_t>(2.0f * c2v * 65536.0f);
+        for (int i = jb.a; i < jb.b; ++i) {
+          const int iu = (U >> 16) & (TW - 1);
+          int iv = V >> 16;
+          if (iv > TH - 1) iv = TH - 1;
+          if (iv < 0) iv = 0;
+          row[i] = tex[iv * TW + iu];
+          U += dU;
+          V += dV;
+          dU += ddU;
+          dV += ddV;
+        }
+      } else {
+        stack[sp++] = Job{m, jb.b, jb.pm, jb.pb, p3};
+        stack[sp++] = Job{jb.a, m, jb.pa, jb.pm, p1};
       }
     }
     pa = pb;

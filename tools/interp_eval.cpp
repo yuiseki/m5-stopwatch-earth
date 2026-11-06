@@ -8,6 +8,7 @@
 // worst distance, and exact evaluations per pixel (the cost; the exact renderer is 1.0).
 #include "globe_math.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -61,6 +62,47 @@ int main() {
       }
       std::printf("%4d %5.2f  %7.3f  %8.4f  %5d  %8.3f\n", seg, tol, 100.0 * differ / px, 100.0 * far / px, worst,
                   double(evals) / px);
+    }
+  }
+
+  // Quadratic rows. Error in screen pixels: texel error divided by the local squeeze (texels per
+  // pixel, from the exact neighbours), floored at one texel per pixel.
+  std::printf("\nquadratic: seg   tol  differ%%  >1texel%%  worst_tex  worst_px  >1px%%  evals/px\n");
+  for (int seg : {32, 64, 128}) {
+    for (float tol : {0.25f, 0.5f}) {
+      long px = 0, differ = 0, far = 0, evals = 0, far_px = 0;
+      int worst = 0;
+      float worst_px = 0;
+      for (const View& v : views) {
+        for (int j = 0; j < N; ++j) {
+          int i0, i1;
+          if (!disc.row_span(j, N, &i0, &i1)) continue;
+          render_row<TW, TH>(v, disc, j, i0, i1, 1, 0, tex.data(), exact.data());
+          evals += render_row_quadratic<TW, TH>(v, disc, j, i0, i1, seg, tol, tex.data(), approx.data());
+          auto dist = [](uint32_t a, uint32_t b) {
+            int du = std::abs(int(a % TW) - int(b % TW));
+            if (du > TW / 2) du = TW - du;
+            const int dv = std::abs(int(a / TW) - int(b / TW));
+            return du > dv ? du : dv;
+          };
+          for (int i = i0; i <= i1; ++i) {
+            ++px;
+            if (exact[i] == approx[i]) continue;
+            ++differ;
+            const int dd = dist(exact[i], approx[i]);
+            if (dd > 1) ++far;
+            if (dd > worst) worst = dd;
+            int sq = 1;
+            if (i > i0) sq = std::max(sq, dist(exact[i], exact[i - 1]));
+            if (i < i1) sq = std::max(sq, dist(exact[i], exact[i + 1]));
+            const float e_px = float(dd) / float(sq);
+            if (e_px > 1.0f) ++far_px;
+            if (e_px > worst_px) worst_px = e_px;
+          }
+        }
+      }
+      std::printf("           %4d %5.2f  %7.3f  %8.4f  %9d  %8.2f  %5.3f  %8.3f\n", seg, tol, 100.0 * differ / px,
+                  100.0 * far / px, worst, worst_px, 100.0 * far_px / px, double(evals) / px);
     }
   }
   return 0;
