@@ -211,6 +211,31 @@ void run_bench() {
     Serial.printf("BENCH %s pixels=%ld ms=%.2f cycles_per_px=%.1f sum=%u\n", var.name, pixels, us / 1000.0f,
                   us * (float)getCpuFrequencyMhz() / pixels, (unsigned)sum);
   }
+  // The fill loop alone: no exact evaluation, u and v stepped like an accepted segment.
+  for (const uint16_t* tex : {g_tex, (const uint16_t*)psram_tex}) {
+    if (!tex) continue;
+    uint32_t sum = 0;
+    const uint32_t t0 = micros();
+    for (int j = 0; j < g_h; ++j) {
+      int i0, i1;
+      if (!g_disc.row_span(j, g_w, &i0, &i1)) continue;
+      int32_t U = (j * 3) << 16, V = (j * TH / g_h) << 16;
+      const int32_t dU = 46000, dV = 3000;  // about 0.7 and 0.05 texel per pixel
+      for (int i = i0; i <= i1; ++i) {
+        const int iu = (U >> 16) & (TW - 1);
+        int iv = V >> 16;
+        if (iv > TH - 1) iv = TH - 1;
+        if (iv < 0) iv = 0;
+        rowbuf[i] = tex[iv * TW + iu];
+        U += dU;
+        V += dV;
+      }
+      sum += rowbuf[(i0 + i1) / 2];
+    }
+    const uint32_t us = micros() - t0;
+    Serial.printf("BENCH fill_only_%s ms=%.2f cycles_per_px=%.1f sum=%u\n", tex == g_tex ? "flash" : "psram",
+                  us / 1000.0f, us * (float)getCpuFrequencyMhz() / pixels, (unsigned)sum);
+  }
   heap_caps_free(rowbuf);
 
   // Display transfer: how long does pushImageDMA block, and how long until the DMA is done?

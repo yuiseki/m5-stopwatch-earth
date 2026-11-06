@@ -1,6 +1,7 @@
 // Host tests for include/globe_math.h. Build and run with `make test`.
 #include "globe_math.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +41,23 @@ static void test_atan2_accuracy() {
   CHECK(fast_atan2(0, 0) == 0.0f, "atan2(0,0) must be 0");
   CHECK(std::fabs(fast_atan2(1, 0) - kPi / 2) < 1e-5f, "atan2(1,0)");
   CHECK(std::fabs(fast_atan2(0, -1) - kPi) < 1e-5f, "atan2(0,-1)");
+}
+
+static void test_fast_scalar_ops() {
+  std::mt19937 rng(3);
+  std::uniform_real_distribution<float> d(1e-6f, 2.0f);
+  float worst_sqrt = 0, worst_recip = 0;
+  for (int k = 0; k < 200000; ++k) {
+    const float x = d(rng);
+    worst_sqrt = std::max(worst_sqrt, std::fabs(fast_sqrt(x) - std::sqrt(x)) / std::sqrt(x));
+    worst_recip = std::max(worst_recip, std::fabs(fast_recip(x) * x - 1.0f));
+  }
+  std::printf("fast_sqrt worst rel error %.3g, fast_recip worst rel error %.3g\n", worst_sqrt, worst_recip);
+  CHECK(worst_sqrt < 1e-5f, "fast_sqrt rel error %g", worst_sqrt);
+  CHECK(worst_recip < 2e-6f, "fast_recip rel error %g", worst_recip);
+  CHECK(fast_sqrt(0.0f) == 0.0f && fast_sqrt(-1.0f) == 0.0f, "fast_sqrt of 0 and negatives is 0");
+  for (float x : {-2.5f, -2.0f, -0.5f, -0.0f, 0.0f, 0.5f, 1.0f, 1023.999f, 1024.0f, -1024.0f})
+    CHECK(fast_floor(x) == (int)std::floor(x), "fast_floor(%g) = %d", x, fast_floor(x));
 }
 
 static void test_centre_shows_view_centre() {
@@ -187,6 +205,7 @@ static void test_adaptive_single_pixel_rows() {
 
 int main() {
   test_atan2_accuracy();
+  test_fast_scalar_ops();
   test_centre_shows_view_centre();
   test_up_is_north();
   test_texel_corners();

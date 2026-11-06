@@ -20,6 +20,54 @@ namespace globe {
 
 constexpr float kPi = 3.14159265358979323846f;
 
+// Square root, reciprocal and floor from multiplies only.
+//
+// On the ESP32-S3, GCC turns sqrtf, float division and floorf into library calls (sqrtf
+// handles errno, division is soft-float __divsf3), and those calls were most of the 550 cycles
+// an exact pixel cost. These versions start from a bit-level estimate and refine it with
+// Newton steps, so they compile to FPU multiply-adds on the device.
+
+// Bit reinterpretation through a union (defined behaviour in GCC and Clang). std::memcpy was
+// not inlined by the ESP32-S3 toolchain and became a real call in the per-pixel loop.
+union FloatBits {
+  float f;
+  uint32_t u;
+};
+
+// 1/sqrt(x) for x > 0. Relative error below 1e-5 after two Newton steps (measured 4.8e-6;
+// float rounding in the steps keeps it above the 1e-9 the iteration alone would reach).
+inline float fast_rsqrt(float x) {
+  FloatBits b;
+  b.f = x;
+  b.u = 0x5f375a86u - (b.u >> 1);
+  float y = b.f;
+  const float hx = 0.5f * x;
+  y = y * (1.5f - hx * y * y);
+  y = y * (1.5f - hx * y * y);
+  return y;
+}
+
+// sqrt(x) for x >= 0 (0 for x <= 0).
+inline float fast_sqrt(float x) { return x > 0.0f ? x * fast_rsqrt(x) : 0.0f; }
+
+// 1/x for x > 0. Relative error below 1e-7 after three Newton steps.
+inline float fast_recip(float x) {
+  FloatBits b;
+  b.f = x;
+  b.u = 0x7ef311c7u - b.u;
+  float y = b.f;
+  y = y * (2.0f - x * y);
+  y = y * (2.0f - x * y);
+  y = y * (2.0f - x * y);
+  return y;
+}
+
+// floor(x) for |x| < 2^31.
+inline int fast_floor(float x) {
+  const int i = static_cast<int>(x);
+  return i - (x < static_cast<float>(i) ? 1 : 0);
+}
+
 // atan(t) for t in [0, 1]. Minimax odd polynomial, max error about 1e-5 rad,
 // which is 0.002 texel on a 1024-wide texture.
 inline float atan01(float t) {
@@ -35,7 +83,7 @@ inline float fast_atan2(float y, float x) {
   const float mx = ax > ay ? ax : ay;
   const float mn = ax > ay ? ay : ax;
   if (mx == 0.0f) return 0.0f;
-  float a = atan01(mn / mx);
+  float a = atan01(mn * fast_recip(mx));
   if (ay > ax) a = 0.5f * kPi - a;
   if (x < 0.0f) a = kPi - a;
   return y < 0.0f ? -a : a;
@@ -88,14 +136,14 @@ inline uint32_t view_to_texel_fast(const View& v, float x, float y, float z) {
   const float wx = x;
   const float wy = y * v.cos_lat0 + z * v.sin_lat0;
   const float wz = z * v.cos_lat0 - y * v.sin_lat0;
-  const float horiz = std::sqrt(wx * wx + wz * wz);
+  const float horiz = fast_sqrt(wx * wx + wz * wz);
   const float lat = fast_atan2(wy, horiz);
   const float lon = v.lon0 + fast_atan2(wx, wz);
   const float u = (lon + kPi) * (TW / (2.0f * kPi));
   const float vv = (0.5f * kPi - lat) * (TH / kPi);
   // u may be far outside [0, TW) when lon0 has accumulated; floor then mask keeps it right
   // for |u| < 2^24, which is about 16000 turns of the globe.
-  int iu = static_cast<int>(std::floor(u)) & (TW - 1);
+  int iu = fast_floor(u) & (TW - 1);
   int iv = static_cast<int>(vv);
   if (iv < 0) iv = 0;
   if (iv > TH - 1) iv = TH - 1;
@@ -109,11 +157,12 @@ inline void view_to_uv(const View& v, float x, float y, float z, float* u, float
   const float wx = x;
   const float wy = y * v.cos_lat0 + z * v.sin_lat0;
   const float wz = z * v.cos_lat0 - y * v.sin_lat0;
-  const float horiz = std::sqrt(wx * wx + wz * wz);
+  const float horiz = fast_sqrt(wx * wx + wz * wz);
   const float lat = fast_atan2(wy, horiz);
   const float lon = v.lon0 + fast_atan2(wx, wz);
   float uu = (lon + kPi) * (TW / (2.0f * kPi));
-  uu -= TW * std::floor(uu * (1.0f / TW));
+  uu -= TW * static_cast<float>(fast_floor(uu * (1.0f / TW)));
+  if (uu >= TW) uu -= TW;  // rounding can land exactly on TW
   *u = uu;
   *vv = (0.5f * kPi - lat) * (TH / kPi);
 }
@@ -191,7 +240,7 @@ inline int render_row_adaptive(const View& v, const Disc& d, int j, int i0, int 
     float rem = 1.0f - px * px - py2;
     if (rem < 0.0f) rem = 0.0f;  // span edge rounding
     UV r;
-    view_to_uv<TW, TH>(v, px, py, std::sqrt(rem), &r.u, &r.v);
+    view_to_uv<TW, TH>(v, px, py, fast_sqrt(rem), &r.u, &r.v);
     ++evals;
     return r;
   };
@@ -204,7 +253,7 @@ inline int render_row_adaptive(const View& v, const Disc& d, int j, int i0, int 
   auto put = [&](int i, const UV& p) { row[i] = tex[latlon_texel_from_uv<TW, TH>(p.u, p.v)]; };
   // Linear fill of [a, b) from p (at a) towards q (at b).
   auto lerp_fill = [&](int a, int b, const UV& p, const UV& q) {
-    const float inv = 1.0f / static_cast<float>(b - a);
+    const float inv = fast_recip(static_cast<float>(b - a));
     int32_t U = static_cast<int32_t>(p.u * 65536.0f);
     int32_t V = static_cast<int32_t>(p.v * 65536.0f);
     const int32_t dU = static_cast<int32_t>(wrap(q.u - p.u) * inv * 65536.0f);
@@ -241,7 +290,7 @@ inline int render_row_adaptive(const View& v, const Disc& d, int j, int i0, int 
       }
       const int m = (job.a + job.b) / 2;
       const UV pm = exact(m);
-      const float t = static_cast<float>(m - job.a) / static_cast<float>(n);
+      const float t = static_cast<float>(m - job.a) * fast_recip(static_cast<float>(n));
       const float eu = std::fabs(wrap(pm.u - job.p.u) - t * wrap(job.q.u - job.p.u));
       const float ev = std::fabs((pm.v - job.p.v) - t * (job.q.v - job.p.v));
       if (eu <= tol && ev <= tol) {
@@ -277,7 +326,7 @@ inline void render_row(const View& v, const Disc& d, int j, int i0, int i1, int 
     *px = (static_cast<float>(i) + 0.5f - d.cx) * d.inv_r;
     float rem = 1.0f - *px * *px - py2;
     if (rem < 0.0f) rem = 0.0f;  // span edge rounding
-    return std::sqrt(rem);
+    return fast_sqrt(rem);
   };
   if (step <= 1) {
     for (int i = i0; i <= i1; ++i) {
