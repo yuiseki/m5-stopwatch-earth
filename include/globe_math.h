@@ -158,6 +158,14 @@ struct View {
     }
   }
 
+  // North up, the equator at the centre, keeping the longitude now facing the viewer. With a
+  // pole at the centre there is no such longitude and 0 is used.
+  View equator_reset() const {
+    // The centre of the disc is view (0, 0, 1), world (m[2], m[5], m[8]).
+    const float lon = (m[2] == 0.0f && m[8] == 0.0f) ? 0.0f : std::atan2(m[2], m[8]);
+    return make(0.0f, lon);
+  }
+
   // Undo float drift after many small rotations (Gram-Schmidt on the rows).
   void orthonormalize() {
     auto norm = [](float* r) {

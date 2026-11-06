@@ -24,6 +24,8 @@ touch sample to the end of the frame that shows it.
 - Touch mode: entered on the first contact (the touch controller's INT line, G13). Dragging
   turns the globe like a trackball, with no limit: over a pole and on to upside down. The
   orientation is a rotation matrix (`globe::View`), not a latitude and longitude. The left button (yellow) goes back to spin.
+- The left button (yellow) also turns the globe north up with the equator at the centre,
+  keeping the longitude that faces the viewer.
 - The right button (blue) switches between rendering on one core and on both.
 
 ## How it renders

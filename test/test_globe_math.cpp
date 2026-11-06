@@ -348,6 +348,23 @@ static void test_many_drags_stay_a_rotation() {
   CHECK(worst < 1e-5f, "after 10000 drags M M^T is off by %g", worst);
 }
 
+static void test_equator_reset_keeps_the_facing_longitude() {
+  View v = View::make(0.3f, 2.0f);
+  for (int k = 0; k < 37; ++k) v.drag(9.0f, 13.0f, 234.0f);  // somewhere odd, maybe upside down
+  float clat, clon, tlat;
+  centre_and_top(v, &clat, &clon, &tlat);
+  const View r = v.equator_reset();
+  float rlat, rlon, rtlat;
+  centre_and_top(r, &rlat, &rlon, &rtlat);
+  CHECK(std::fabs(rlat) < 1e-5f, "reset centre lat %g", rlat / kDeg);
+  CHECK(std::fabs(rlon - clon) < 1e-4f, "reset keeps lon %g, got %g", clon / kDeg, rlon / kDeg);
+  CHECK(std::fabs(rtlat - kPi / 2) < 1e-5f, "reset puts north on top, top lat %g", rtlat / kDeg);
+  // From a pole at the centre: lon 0.
+  const View p = View::make(kPi / 2, 1.0f).equator_reset();
+  centre_and_top(p, &rlat, &rlon, &rtlat);
+  CHECK(std::fabs(rlat) < 1e-5f && std::fabs(rtlat - kPi / 2) < 1e-5f, "reset from the pole");
+}
+
 int main() {
   test_atan2_accuracy();
   test_fast_scalar_ops();
@@ -365,6 +382,7 @@ int main() {
   test_drag_right_brings_the_west();
   test_spin_equals_turning_longitude();
   test_many_drags_stay_a_rotation();
+  test_equator_reset_keeps_the_facing_longitude();
   if (g_failures) {
     std::printf("%d failure(s)\n", g_failures);
     return 1;

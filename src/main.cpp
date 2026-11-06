@@ -9,7 +9,8 @@
 //           The touch controller's interrupt line still switches to TOUCH on the first contact.
 //   TOUCH - touch is read once per frame, dragging turns the globe. Measures drawing with
 //           touch, and the delay from the touch sample to the end of the frame that shows it.
-//           The left button goes back to SPIN.
+//           The left button goes back to SPIN and turns the globe north up with the equator
+//           at the centre, keeping the longitude that faces the viewer.
 // Both the button and the touch line are caught by GPIO interrupts: a frame takes hundreds of
 // milliseconds in the first cut, and polling once per frame missed short presses.
 //
@@ -56,6 +57,9 @@ constexpr int kButtonRight = 1; // KEYB, blue: toggles one or two rendering core
 volatile bool g_right_edge = false;
 void IRAM_ATTR on_right() { g_right_edge = true; }
 constexpr int kTouchInt = 13;   // TP_INT, low while the controller has a report
+// Left button: back to spin, north up, the equator at the centre. The button bounces on
+// release too (a second falling edge 0.1-0.3 s after the press), which is why it does one
+// idempotent thing rather than telling single presses from double clicks.
 volatile bool g_button_edge = false;
 volatile bool g_touch_edge = false;
 void IRAM_ATTR on_button() { g_button_edge = true; }
@@ -513,7 +517,8 @@ void loop() {
   if (g_button_edge) {
     g_button_edge = false;
     next = Mode::Spin;
-    Serial.println("EVENT button");
+    g_view = g_view.equator_reset();
+    Serial.println("EVENT button equator_reset");
   }
   if (g_touch_edge) {
     g_touch_edge = false;
