@@ -16,6 +16,7 @@
 // Every 2 s a STAT line goes to USB serial (see tools/serial_log.py).
 #include <M5Unified.h>
 #include <esp_heap_caps.h>
+#include <lgfx/v1/panel/Panel_CO5300.hpp>  // Panel_AMOLED and its framebuffer (needs LGFX_USE_QSPI, set by M5GFX on ESP32-S3)
 
 #include "globe_math.h"
 
@@ -24,9 +25,30 @@ extern const uint8_t tex_end[] asm("_binary_data_earth_1024x512_rgb565be_end");
 
 namespace {
 
+// On the StopWatch, M5.Display is a PSRAM framebuffer (Panel_AMOLED_Framebuffer) in front of
+// the CO5300 panel. Writes land in the framebuffer, and every endWrite() then sends the whole
+// 438 KB to the panel, blocking for about 22 ms. Strips are sent to the panel underneath
+// instead, so each strip's DMA runs while the next strip is being rendered.
+// The framebuffer keeps that panel in a protected member; a member pointer taken inside a
+// derived class reaches it without casting the object.
+struct FbPeek : lgfx::Panel_AMOLED_Framebuffer {
+  static lgfx::Panel_AMOLED* underlying(lgfx::Panel_AMOLED_Framebuffer* fb) { return fb->*(&FbPeek::_panel); }
+};
+lgfx::LGFX_Device g_direct;
+lgfx::LGFX_Device* g_out = nullptr;  // &g_direct, or &M5.Display if the panel could not be reached
+bool g_direct_ok = false;
+
 constexpr int TW = 1024, TH = 512;
 constexpr int kStripLines = 16;
+// Adaptive row interpolation (see globe::render_row_adaptive). On the host, seg 32 / tol 0.5
+// never strays more than one texel from the exact mapping and needs 0.17 exact evaluations per
+// pixel (tools/interp_eval.cpp).
+constexpr int kSeg = 32;
+constexpr float kTol = 0.5f;
 constexpr int kButtonLeft = 2;  // KEYA, yellow
+constexpr int kButtonRight = 1; // KEYB, blue: toggles one or two rendering cores
+volatile bool g_right_edge = false;
+void IRAM_ATTR on_right() { g_right_edge = true; }
 constexpr int kTouchInt = 13;   // TP_INT, low while the controller has a report
 volatile bool g_button_edge = false;
 volatile bool g_touch_edge = false;
@@ -48,7 +70,8 @@ float g_lon0 = 135.0f * kDeg;
 // Statistics over one reporting window.
 struct Stats {
   uint32_t frames = 0;
-  uint64_t render_us = 0;   // CPU time spent computing texels
+  uint64_t render_us = 0;   // wall time spent computing texels (both cores, until both are done)
+  uint64_t push_us = 0;     // wall time blocked in the display transfer calls
   uint64_t frame_us = 0;    // wall time per frame, start to DMA done
   uint64_t touch_us = 0;    // time in the touch read
   uint32_t touched_frames = 0;
@@ -59,9 +82,10 @@ struct Stats {
   uint32_t t0_ms = 0;
 } g_stats;
 
-// One strip: rows [y0, y0+lines) into buf, full width, black outside the disc.
-void IRAM_ATTR render_strip(const globe::View& v, int y0, int lines, uint16_t* buf) {
-  for (int r = 0; r < lines; ++r) {
+// Rows [r0, r1) of the strip that starts at screen row y0, into buf (full width, black
+// outside the disc).
+void IRAM_ATTR render_rows(const globe::View& v, int y0, int r0, int r1, uint16_t* buf) {
+  for (int r = r0; r < r1; ++r) {
     const int j = y0 + r;
     uint16_t* row = buf + r * g_w;
     int i0, i1;
@@ -71,35 +95,56 @@ void IRAM_ATTR render_strip(const globe::View& v, int y0, int lines, uint16_t* b
     }
     if (i0 > 0) memset(row, 0, i0 * 2);
     if (i1 < g_w - 1) memset(row + i1 + 1, 0, (g_w - 1 - i1) * 2);
-    const float py = (g_disc.cy - (j + 0.5f)) * g_disc.inv_r;
-    const float py2 = py * py;
-    for (int i = i0; i <= i1; ++i) {
-      const float px = (i + 0.5f - g_disc.cx) * g_disc.inv_r;
-      float rem = 1.0f - px * px - py2;
-      if (rem < 0.0f) rem = 0.0f;  // span edge rounding
-      const float pz = sqrtf(rem);
-      row[i] = g_tex[globe::view_to_texel_fast<TW, TH>(v, px, py, pz)];
-    }
+    globe::render_row_adaptive<TW, TH>(v, g_disc, j, i0, i1, kSeg, kTol, g_tex, row);
   }
 }
 
-// Draws one whole frame. Returns the CPU time spent rendering, in microseconds.
-uint32_t draw_frame(const globe::View& v) {
-  uint32_t render = 0;
+// Second rendering core. The loop task runs on core 1; this worker sits on core 0 and renders
+// the lower half of each strip while the loop renders the upper half.
+int g_cores = 2;
+TaskHandle_t g_worker = nullptr;
+TaskHandle_t g_loop_task = nullptr;
+struct Job {
+  globe::View v;
+  int y0, r0, r1;
+  uint16_t* buf;
+} g_job;
+
+void worker_main(void*) {
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    render_rows(g_job.v, g_job.y0, g_job.r0, g_job.r1, g_job.buf);
+    xTaskNotifyGive(g_loop_task);
+  }
+}
+
+// Draws one whole frame. Adds to g_stats.render_us and g_stats.push_us.
+void draw_frame(const globe::View& v) {
   int b = 0;
-  M5.Display.startWrite();
+  g_out->startWrite();
   for (int y = 0; y < g_h; y += kStripLines) {
     const int lines = (y + kStripLines <= g_h) ? kStripLines : (g_h - y);
     const uint32_t t = micros();
-    render_strip(v, y, lines, g_buf[b]);
-    render += micros() - t;
+    if (g_cores == 2 && lines > 1) {
+      const int split = lines / 2;
+      g_job = Job{v, y, split, lines, g_buf[b]};
+      xTaskNotifyGive(g_worker);
+      render_rows(v, y, 0, split, g_buf[b]);
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    } else {
+      render_rows(v, y, 0, lines, g_buf[b]);
+    }
+    const uint32_t t1 = micros();
+    g_stats.render_us += t1 - t;
     // pushImageDMA waits for the previous transfer, so buffer b^1 is free to fill next.
-    M5.Display.pushImageDMA(0, y, g_w, lines, reinterpret_cast<const lgfx::swap565_t*>(g_buf[b]));
+    g_out->pushImageDMA(0, y, g_w, lines, reinterpret_cast<const lgfx::swap565_t*>(g_buf[b]));
+    g_stats.push_us += micros() - t1;
     b ^= 1;
   }
-  M5.Display.waitDMA();
-  M5.Display.endWrite();
-  return render;
+  const uint32_t t2 = micros();
+  g_out->waitDMA();
+  g_out->endWrite();
+  g_stats.push_us += micros() - t2;
 }
 
 // Touch state carried between frames.
@@ -111,10 +156,10 @@ void report(uint32_t now_ms) {
   const float secs = (now_ms - s.t0_ms) / 1000.0f;
   const float n = s.frames ? s.frames : 1;
   Serial.printf(
-      "STAT mode=%s frames=%u fps=%.2f render_ms=%.2f frame_ms=%.2f touch_ms=%.3f touched=%u "
+      "STAT mode=%s cores=%d frames=%u fps=%.2f render_ms=%.2f push_ms=%.2f frame_ms=%.2f touch_ms=%.3f touched=%u "
       "lat_n=%u lat_avg_ms=%.2f lat_min_ms=%.2f lat_max_ms=%.2f heap=%u psram=%u\n",
-      g_mode == Mode::Spin ? "spin" : "touch", s.frames, s.frames / secs, s.render_us / n / 1000.0f,
-      s.frame_us / n / 1000.0f, s.touch_us / n / 1000.0f, s.touched_frames, s.lat_n,
+      g_mode == Mode::Spin ? "spin" : "touch", g_cores, s.frames, s.frames / secs, s.render_us / n / 1000.0f,
+      s.push_us / n / 1000.0f, s.frame_us / n / 1000.0f, s.touch_us / n / 1000.0f, s.touched_frames, s.lat_n,
       s.lat_n ? s.lat_sum_us / (float)s.lat_n / 1000.0f : 0.0f, s.lat_n ? s.lat_min_us / 1000.0f : 0.0f,
       s.lat_max_us / 1000.0f, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -122,25 +167,21 @@ void report(uint32_t now_ms) {
   s.t0_ms = now_ms;
 }
 
-// Boot-time microbenchmark: one full disc at a fixed view, three variants, one variable each.
-//   math   - texel index only, no memory read
-//   flash  - plus the read from the texture in flash (through the MMU cache)
-//   psram  - plus the read from a copy of the texture in PSRAM
-void IRAM_ATTR bench_pass(const globe::View& v, const uint16_t* tex, uint32_t* out_sum, uint32_t* out_us) {
+// Boot-time microbenchmark: one full disc at a fixed view, rendered row by row into a scratch
+// row (no display transfer). Exact vs adaptive, texture in flash vs a copy in PSRAM.
+void IRAM_ATTR bench_pass(const globe::View& v, const uint16_t* tex, int seg, uint16_t* rowbuf, uint32_t* out_sum,
+                          uint32_t* out_us) {
   uint32_t sum = 0;
   const uint32_t t0 = micros();
   for (int j = 0; j < g_h; ++j) {
     int i0, i1;
     if (!g_disc.row_span(j, g_w, &i0, &i1)) continue;
-    const float py = (g_disc.cy - (j + 0.5f)) * g_disc.inv_r;
-    const float py2 = py * py;
-    for (int i = i0; i <= i1; ++i) {
-      const float px = (i + 0.5f - g_disc.cx) * g_disc.inv_r;
-      float rem = 1.0f - px * px - py2;
-      if (rem < 0.0f) rem = 0.0f;
-      const uint32_t idx = globe::view_to_texel_fast<TW, TH>(v, px, py, sqrtf(rem));
-      sum += tex ? tex[idx] : idx;
+    if (seg <= 1) {
+      globe::render_row<TW, TH>(v, g_disc, j, i0, i1, 1, 0.0f, tex, rowbuf);
+    } else {
+      globe::render_row_adaptive<TW, TH>(v, g_disc, j, i0, i1, seg, kTol, tex, rowbuf);
     }
+    sum += rowbuf[(i0 + i1) / 2];
   }
   *out_us = micros() - t0;
   *out_sum = sum;
@@ -155,17 +196,56 @@ void run_bench() {
   uint16_t* psram_tex = static_cast<uint16_t*>(heap_caps_malloc(TW * TH * 2, MALLOC_CAP_SPIRAM));
   if (psram_tex) memcpy(psram_tex, g_tex, TW * TH * 2);
   const globe::View v = globe::View::make(g_lat0, g_lon0);
+  uint16_t* rowbuf = static_cast<uint16_t*>(heap_caps_malloc(g_w * 2, MALLOC_CAP_INTERNAL));
   struct {
     const char* name;
     const uint16_t* tex;
-  } variants[] = {{"math", nullptr}, {"flash", g_tex}, {"psram", psram_tex}};
+    int seg;
+  } variants[] = {{"exact_flash", g_tex, 1}, {"exact_psram", psram_tex, 1}, {"adaptive_flash", g_tex, kSeg},
+                  {"adaptive_psram", psram_tex, kSeg}};
   for (auto& var : variants) {
-    if (var.tex == nullptr && strcmp(var.name, "math") != 0) continue;
+    if (var.tex == nullptr) continue;
     uint32_t sum, us;
-    bench_pass(v, var.tex, &sum, &us);  // warm-up
-    bench_pass(v, var.tex, &sum, &us);
+    bench_pass(v, var.tex, var.seg, rowbuf, &sum, &us);  // warm-up
+    bench_pass(v, var.tex, var.seg, rowbuf, &sum, &us);
     Serial.printf("BENCH %s pixels=%ld ms=%.2f cycles_per_px=%.1f sum=%u\n", var.name, pixels, us / 1000.0f,
                   us * (float)getCpuFrequencyMhz() / pixels, (unsigned)sum);
+  }
+  heap_caps_free(rowbuf);
+
+  // Display transfer: how long does pushImageDMA block, and how long until the DMA is done?
+  memset(g_buf[0], 0, g_w * kStripLines * 2);
+  for (int lines : {1, 4, 16}) {
+    uint32_t call_us = 0, total_us = 0;
+    const int reps = 20;
+    g_out->startWrite();
+    for (int k = 0; k < reps; ++k) {
+      const uint32_t t0 = micros();
+      g_out->pushImageDMA(0, 0, g_w, lines, reinterpret_cast<const lgfx::swap565_t*>(g_buf[0]));
+      const uint32_t t1 = micros();
+      g_out->waitDMA();
+      const uint32_t t2 = micros();
+      call_us += t1 - t0;
+      total_us += t2 - t0;
+    }
+    g_out->endWrite();
+    const float bytes = g_w * lines * 2.0f;
+    // Back to back with a gap: if the transfer runs in the background, the second call after a
+    // 3 ms gap returns as fast as the first.
+    g_out->startWrite();
+    g_out->pushImageDMA(0, 0, g_w, lines, reinterpret_cast<const lgfx::swap565_t*>(g_buf[0]));
+    delayMicroseconds(3000);
+    const uint32_t g0 = micros();
+    g_out->pushImageDMA(0, 0, g_w, lines, reinterpret_cast<const lgfx::swap565_t*>(g_buf[0]));
+    const uint32_t g1 = micros();
+    g_out->pushImageDMA(0, 0, g_w, lines, reinterpret_cast<const lgfx::swap565_t*>(g_buf[0]));
+    const uint32_t g2 = micros();
+    g_out->endWrite();
+    const uint32_t g3 = micros();
+    Serial.printf("PUSHGAP lines=%d second_call_after_gap_us=%u third_call_back_to_back_us=%u endwrite_us=%u\n", lines,
+                  (unsigned)(g1 - g0), (unsigned)(g2 - g1), (unsigned)(g3 - g2));
+    Serial.printf("PUSH lines=%d bytes=%.0f call_us=%.1f total_us=%.1f mbyte_per_s=%.1f\n", lines, bytes,
+                  call_us / (float)reps, total_us / (float)reps, bytes / (total_us / (float)reps));
   }
   heap_caps_free(psram_tex);
 }
@@ -178,18 +258,43 @@ void setup() {
   Serial.begin(115200);
   pinMode(kButtonLeft, INPUT_PULLUP);
   attachInterrupt(kButtonLeft, on_button, FALLING);
+  pinMode(kButtonRight, INPUT_PULLUP);
+  attachInterrupt(kButtonRight, on_right, FALLING);
+  g_loop_task = xTaskGetCurrentTaskHandle();
+  xTaskCreatePinnedToCore(worker_main, "render0", 4096, nullptr, 1, &g_worker, 0);
 
-  g_w = M5.Display.width();
-  g_h = M5.Display.height();
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.display();
+  g_out = &M5.Display;
+  if (M5.getBoard() == m5::board_t::board_M5StopWatch) {
+    auto* fb = static_cast<lgfx::Panel_AMOLED_Framebuffer*>(M5.Display.getPanel());
+    lgfx::Panel_AMOLED* panel = fb ? FbPeek::underlying(fb) : nullptr;
+    if (panel) {
+      g_direct.setPanel(panel);
+      // Not init()ed (the panel already is), so the clip rectangle is still empty and every
+      // write would be clipped away. Open it to the whole panel.
+      int32_t cx, cy, cw, ch;
+      g_direct.getClipRect(&cx, &cy, &cw, &ch);
+      Serial.printf("BOOT direct clip before=%d,%d,%d,%d\n", (int)cx, (int)cy, (int)cw, (int)ch);
+      g_direct.clearClipRect();
+      g_direct.getClipRect(&cx, &cy, &cw, &ch);
+      Serial.printf("BOOT direct clip after=%d,%d,%d,%d panel=%dx%d\n", (int)cx, (int)cy, (int)cw, (int)ch, (int)g_direct.width(),
+                    (int)g_direct.height());
+      g_out = &g_direct;
+      g_direct_ok = true;
+    }
+  }
+  g_w = g_out->width();
+  g_h = g_out->height();
   g_disc = globe::Disc::make(g_w, g_h);
   g_tex = reinterpret_cast<const uint16_t*>(tex_start);
 
   for (auto& b : g_buf) {
     b = static_cast<uint16_t*>(heap_caps_malloc(g_w * kStripLines * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
   }
-  M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.setSwapBytes(false);
+  g_out->fillScreen(TFT_BLACK);
 
+  Serial.printf("BOOT direct_panel=%d fb=%dx%d\n", g_direct_ok ? 1 : 0, (int)M5.Display.width(), (int)M5.Display.height());
   Serial.printf("BOOT board=%d display=%dx%d texture_bytes=%u expected=%u strip_lines=%d cpu_mhz=%u\n",
                 (int)M5.getBoard(), g_w, g_h, (unsigned)(tex_end - tex_start), (unsigned)(TW * TH * 2), kStripLines,
                 (unsigned)getCpuFrequencyMhz());
@@ -201,6 +306,7 @@ void setup() {
   attachInterrupt(kTouchInt, on_touch_int, FALLING);
   g_touch_edge = false;
   g_button_edge = false;
+  g_right_edge = false;
   g_stats.t0_ms = millis();
 }
 
@@ -215,6 +321,12 @@ void loop() {
   if (g_touch_edge) {
     g_touch_edge = false;
     if (g_mode == Mode::Spin && next == Mode::Spin) next = Mode::Touch;
+  }
+  if (g_right_edge) {
+    g_right_edge = false;
+    report(millis());
+    g_cores = (g_cores == 2) ? 1 : 2;
+    Serial.printf("CORES %d\n", g_cores);
   }
   if (next != g_mode) {
     report(millis());  // close the window of the old mode
@@ -255,7 +367,7 @@ void loop() {
   }
 
   const globe::View v = globe::View::make(g_lat0, g_lon0);
-  g_stats.render_us += draw_frame(v);
+  draw_frame(v);
   const uint32_t done = micros();
   g_stats.frame_us += done - f0;
   ++g_stats.frames;

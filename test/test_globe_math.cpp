@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <vector>
 
 using namespace globe;
 
@@ -134,6 +135,56 @@ static void test_row_span_matches_pixel_test() {
   }
 }
 
+static void test_adaptive_rows_stay_within_one_texel() {
+  // The device default (seg 32, tol 0.5) against the exact renderer: never more than one texel
+  // off, at random views and looking straight down at each pole.
+  std::vector<uint32_t> tex(TW * TH);
+  for (uint32_t k = 0; k < tex.size(); ++k) tex[k] = k;
+  const int n = 468;
+  const Disc disc = Disc::make(n, n);
+  std::vector<uint32_t> a(n), b(n);
+  std::mt19937 rng(7);
+  std::uniform_real_distribution<float> uni(0.0f, 1.0f);
+  std::vector<View> views = {View::make(89.5f * kDeg, 0.1f), View::make(-89.5f * kDeg, -3.0f), View::make(0, 0)};
+  for (int k = 0; k < 12; ++k) views.push_back(View::make(std::asin(2 * uni(rng) - 1), (2 * uni(rng) - 1) * kPi));
+  long px = 0, evals = 0;
+  int worst = 0;
+  for (const View& v : views)
+    for (int j = 0; j < n; ++j) {
+      int i0, i1;
+      if (!disc.row_span(j, n, &i0, &i1)) continue;
+      render_row<TW, TH>(v, disc, j, i0, i1, 1, 0, tex.data(), a.data());
+      evals += render_row_adaptive<TW, TH>(v, disc, j, i0, i1, 32, 0.5f, tex.data(), b.data());
+      for (int i = i0; i <= i1; ++i) {
+        ++px;
+        int du = std::abs(int(a[i] % TW) - int(b[i] % TW));
+        if (du > TW / 2) du = TW - du;
+        const int dv = std::abs(int(a[i] / TW) - int(b[i] / TW));
+        if (du > worst) worst = du;
+        if (dv > worst) worst = dv;
+      }
+    }
+  CHECK(worst <= 1, "adaptive rows drift %d texels from exact", worst);
+  CHECK(evals * 4 < px, "adaptive rows evaluated %ld times for %ld pixels", evals, px);
+  std::printf("adaptive seg32 tol0.5: worst %d texel, %.3f evals/px\n", worst, double(evals) / px);
+}
+
+static void test_adaptive_single_pixel_rows() {
+  // The top and bottom rows of a disc can be one or two pixels wide.
+  std::vector<uint32_t> tex(TW * TH);
+  for (uint32_t k = 0; k < tex.size(); ++k) tex[k] = k;
+  const Disc disc = Disc::make(468, 468);
+  const View v = View::make(0.3f, 1.0f);
+  std::vector<uint32_t> a(468, 0xFFFFFFFFu), b(468, 0xFFFFFFFFu);
+  for (int w = 0; w < 3; ++w) {
+    const int i0 = 200, i1 = 200 + w;
+    render_row<TW, TH>(v, disc, 100, i0, i1, 1, 0, tex.data(), a.data());
+    render_row_adaptive<TW, TH>(v, disc, 100, i0, i1, 32, 0.5f, tex.data(), b.data());
+    for (int i = i0; i <= i1; ++i) CHECK(a[i] == b[i], "width %d col %d: %u vs %u", w + 1, i, a[i], b[i]);
+    CHECK(b[i1 + 1] == 0xFFFFFFFFu, "wrote past i1 for width %d", w + 1);
+  }
+}
+
 int main() {
   test_atan2_accuracy();
   test_centre_shows_view_centre();
@@ -142,6 +193,8 @@ int main() {
   test_fast_matches_ref_over_disc();
   test_accumulated_lon_wraps();
   test_row_span_matches_pixel_test();
+  test_adaptive_rows_stay_within_one_texel();
+  test_adaptive_single_pixel_rows();
   if (g_failures) {
     std::printf("%d failure(s)\n", g_failures);
     return 1;

@@ -102,6 +102,32 @@ inline uint32_t view_to_texel_fast(const View& v, float x, float y, float z) {
   return static_cast<uint32_t>(iv) * TW + static_cast<uint32_t>(iu);
 }
 
+// Continuous texel coordinates for a view-frame point: u in [0, TW) (wrapped), v in [0, TH].
+// Column iu = floor(u), row iv = min(floor(v), TH - 1) reproduce view_to_texel_fast.
+template <int TW, int TH>
+inline void view_to_uv(const View& v, float x, float y, float z, float* u, float* vv) {
+  const float wx = x;
+  const float wy = y * v.cos_lat0 + z * v.sin_lat0;
+  const float wz = z * v.cos_lat0 - y * v.sin_lat0;
+  const float horiz = std::sqrt(wx * wx + wz * wz);
+  const float lat = fast_atan2(wy, horiz);
+  const float lon = v.lon0 + fast_atan2(wx, wz);
+  float uu = (lon + kPi) * (TW / (2.0f * kPi));
+  uu -= TW * std::floor(uu * (1.0f / TW));
+  *u = uu;
+  *vv = (0.5f * kPi - lat) * (TH / kPi);
+}
+
+// Texel index from the continuous coordinates of view_to_uv.
+template <int TW, int TH>
+inline uint32_t latlon_texel_from_uv(float u, float vv) {
+  const int iu = static_cast<int>(u) & (TW - 1);
+  int iv = static_cast<int>(vv);
+  if (iv < 0) iv = 0;
+  if (iv > TH - 1) iv = TH - 1;
+  return static_cast<uint32_t>(iv) * TW + static_cast<uint32_t>(iu);
+}
+
 // Screen geometry: a disc of radius r centred at (cx, cy) in pixel coordinates.
 // Pixel (i, j) samples at its centre.
 struct Disc {
@@ -137,5 +163,184 @@ struct Disc {
     return true;
   }
 };
+
+// One row by adaptive subdivision, pixels [i0, i1] of row j, written to row[i0..i1].
+//
+// The row is cut into segments of `seg` pixels (a power of two). For each segment the exact
+// mapping is evaluated at both ends and at the midpoint. If the midpoint lies within `tol`
+// texels of the straight line between the ends, the two halves are filled by linear
+// interpolation (16.16 fixed point) through the three exact points; otherwise each half is
+// handled the same way. Halves of two pixels or fewer are computed exactly.
+//
+// The midpoint test measures how much the mapping bends, which is what makes linear
+// interpolation wrong; it bends near the poles and along the limb. How fast u and v move does
+// not matter: they move about 0.7 texel per pixel at the disc centre already.
+//
+// Returns the number of exact evaluations, for cost accounting.
+template <int TW, int TH, typename Pixel>
+inline int render_row_adaptive(const View& v, const Disc& d, int j, int i0, int i1, int seg, float tol,
+                               const Pixel* tex, Pixel* row) {
+  const float py = (d.cy - (static_cast<float>(j) + 0.5f)) * d.inv_r;
+  const float py2 = py * py;
+  int evals = 0;
+  struct UV {
+    float u, v;
+  };
+  auto exact = [&](int i) {
+    const float px = (static_cast<float>(i) + 0.5f - d.cx) * d.inv_r;
+    float rem = 1.0f - px * px - py2;
+    if (rem < 0.0f) rem = 0.0f;  // span edge rounding
+    UV r;
+    view_to_uv<TW, TH>(v, px, py, std::sqrt(rem), &r.u, &r.v);
+    ++evals;
+    return r;
+  };
+  // u difference taken the short way round the texture.
+  auto wrap = [](float du) {
+    if (du > 0.5f * TW) du -= TW;
+    if (du < -0.5f * TW) du += TW;
+    return du;
+  };
+  auto put = [&](int i, const UV& p) { row[i] = tex[latlon_texel_from_uv<TW, TH>(p.u, p.v)]; };
+  // Linear fill of [a, b) from p (at a) towards q (at b).
+  auto lerp_fill = [&](int a, int b, const UV& p, const UV& q) {
+    const float inv = 1.0f / static_cast<float>(b - a);
+    int32_t U = static_cast<int32_t>(p.u * 65536.0f);
+    int32_t V = static_cast<int32_t>(p.v * 65536.0f);
+    const int32_t dU = static_cast<int32_t>(wrap(q.u - p.u) * inv * 65536.0f);
+    const int32_t dV = static_cast<int32_t>((q.v - p.v) * inv * 65536.0f);
+    for (int i = a; i < b; ++i) {
+      const int iu = (U >> 16) & (TW - 1);
+      int iv = V >> 16;
+      if (iv > TH - 1) iv = TH - 1;
+      if (iv < 0) iv = 0;
+      row[i] = tex[iv * TW + iu];
+      U += dU;
+      V += dV;
+    }
+  };
+  // Fills [a, b) given exact values at a and b. Explicit stack: depth is log2(seg).
+  struct Job {
+    int a, b;
+    UV p, q;
+  };
+  Job stack[24];
+  UV pa = exact(i0);
+  for (int a = i0; a < i1;) {
+    const int b = (a + seg < i1) ? a + seg : i1;
+    const UV pb = exact(b);
+    int sp = 0;
+    stack[sp++] = Job{a, b, pa, pb};
+    while (sp) {
+      const Job job = stack[--sp];
+      const int n = job.b - job.a;
+      if (n <= 2) {
+        put(job.a, job.p);
+        if (n == 2) put(job.a + 1, exact(job.a + 1));
+        continue;
+      }
+      const int m = (job.a + job.b) / 2;
+      const UV pm = exact(m);
+      const float t = static_cast<float>(m - job.a) / static_cast<float>(n);
+      const float eu = std::fabs(wrap(pm.u - job.p.u) - t * wrap(job.q.u - job.p.u));
+      const float ev = std::fabs((pm.v - job.p.v) - t * (job.q.v - job.p.v));
+      if (eu <= tol && ev <= tol) {
+        lerp_fill(job.a, m, job.p, pm);
+        lerp_fill(m, job.b, pm, job.q);
+      } else {
+        stack[sp++] = Job{m, job.b, pm, job.q};
+        stack[sp++] = Job{job.a, m, job.p, pm};
+      }
+    }
+    pa = pb;
+    a = b;
+  }
+  put(i1, pa);
+  return evals;
+}
+
+// One row of the disc, pixels [i0, i1] of row j, written to row[i0..i1].
+//
+// The exact mapping (view_to_texel_fast) costs two atan2, two sqrt and a division per pixel.
+// Here it is evaluated only at anchors every `step` pixels; between anchors the texel
+// coordinates are interpolated linearly in 16.16 fixed point. A segment is computed exactly
+// instead when u or v moves faster than `max_rate` texels per pixel, which is where the
+// mapping bends hard: around the poles (longitude sweeps) and along the limb.
+//
+// step = 1 is the exact renderer.
+template <int TW, int TH, typename Pixel>
+inline void render_row(const View& v, const Disc& d, int j, int i0, int i1, int step, float max_rate,
+                       const Pixel* tex, Pixel* row) {
+  const float py = (d.cy - (static_cast<float>(j) + 0.5f)) * d.inv_r;
+  const float py2 = py * py;
+  auto view_z = [&](int i, float* px) {
+    *px = (static_cast<float>(i) + 0.5f - d.cx) * d.inv_r;
+    float rem = 1.0f - *px * *px - py2;
+    if (rem < 0.0f) rem = 0.0f;  // span edge rounding
+    return std::sqrt(rem);
+  };
+  if (step <= 1) {
+    for (int i = i0; i <= i1; ++i) {
+      float px;
+      const float pz = view_z(i, &px);
+      row[i] = tex[view_to_texel_fast<TW, TH>(v, px, py, pz)];
+    }
+    return;
+  }
+  float px;
+  float ua, va;
+  {
+    const float pz = view_z(i0, &px);
+    view_to_uv<TW, TH>(v, px, py, pz, &ua, &va);
+  }
+  for (int a = i0; a <= i1;) {
+    int b = a + step;
+    if (b > i1) b = i1;
+    const int len = b - a;
+    if (len == 0) {  // single pixel row, or the last pixel
+      row[a] = tex[latlon_texel_from_uv<TW, TH>(ua, va)];
+      break;
+    }
+    float ub, vb;
+    {
+      const float pz = view_z(b, &px);
+      view_to_uv<TW, TH>(v, px, py, pz, &ub, &vb);
+    }
+    float du = ub - ua;
+    if (du > 0.5f * TW) du -= TW;
+    if (du < -0.5f * TW) du += TW;
+    const float dv = vb - va;
+    const float inv_len = 1.0f / static_cast<float>(len);
+    const float rate_u = std::fabs(du) * inv_len;
+    const float rate_v = std::fabs(dv) * inv_len;
+    if (rate_u > max_rate || rate_v > max_rate) {
+      for (int i = a; i < b; ++i) {
+        const float pz = view_z(i, &px);
+        row[i] = tex[view_to_texel_fast<TW, TH>(v, px, py, pz)];
+      }
+    } else {
+      int32_t U = static_cast<int32_t>(ua * 65536.0f);
+      int32_t V = static_cast<int32_t>(va * 65536.0f);
+      const int32_t dU = static_cast<int32_t>(du * inv_len * 65536.0f);
+      const int32_t dV = static_cast<int32_t>(dv * inv_len * 65536.0f);
+      for (int i = a; i < b; ++i) {
+        const int iu = (U >> 16) & (TW - 1);
+        int iv = V >> 16;
+        if (iv > TH - 1) iv = TH - 1;
+        if (iv < 0) iv = 0;
+        row[i] = tex[iv * TW + iu];
+        U += dU;
+        V += dV;
+      }
+    }
+    if (b == i1) {
+      row[b] = tex[latlon_texel_from_uv<TW, TH>(ub, vb)];
+      break;
+    }
+    ua = ub;
+    va = vb;
+    a = b;
+  }
+}
 
 }  // namespace globe

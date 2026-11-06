@@ -16,3 +16,7 @@ build/host_render: tools/host_render.cpp include/globe_math.h
 
 clean:
 	rm -rf build
+
+build/interp_eval: tools/interp_eval.cpp include/globe_math.h
+	@mkdir -p build
+	$(CXX) $(CXXFLAGS) -o $@ $<
