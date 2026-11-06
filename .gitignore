@@ -1,0 +1,8 @@
+.pio/
+build/
+*.log
+logs/
+shots/
+__pycache__/
+*.pyc
+*.preview.png
