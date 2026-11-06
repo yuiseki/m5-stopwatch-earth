@@ -4,10 +4,14 @@
 // strip is on its way to the panel the CPU fills the other. Every texel comes from the
 // 1024x512 RGB565 texture embedded in flash.
 //
-// Modes (left button toggles):
-//   SPIN  - the globe turns by itself, touch is not read. Measures drawing alone.
+// Modes:
+//   SPIN  - the globe turns by itself, touch is not read over I2C. Measures drawing alone.
+//           The touch controller's interrupt line still switches to TOUCH on the first contact.
 //   TOUCH - touch is read once per frame, dragging turns the globe. Measures drawing with
 //           touch, and the delay from the touch sample to the end of the frame that shows it.
+//           The left button goes back to SPIN.
+// Both the button and the touch line are caught by GPIO interrupts: a frame takes hundreds of
+// milliseconds in the first cut, and polling once per frame missed short presses.
 //
 // Every 2 s a STAT line goes to USB serial (see tools/serial_log.py).
 #include <M5Unified.h>
@@ -23,6 +27,11 @@ namespace {
 constexpr int TW = 1024, TH = 512;
 constexpr int kStripLines = 16;
 constexpr int kButtonLeft = 2;  // KEYA, yellow
+constexpr int kTouchInt = 13;   // TP_INT, low while the controller has a report
+volatile bool g_button_edge = false;
+volatile bool g_touch_edge = false;
+void IRAM_ATTR on_button() { g_button_edge = true; }
+void IRAM_ATTR on_touch_int() { g_touch_edge = true; }
 constexpr float kDeg = globe::kPi / 180.0f;
 
 const uint16_t* g_tex = nullptr;  // big-endian RGB565, as the panel takes it
@@ -113,6 +122,54 @@ void report(uint32_t now_ms) {
   s.t0_ms = now_ms;
 }
 
+// Boot-time microbenchmark: one full disc at a fixed view, three variants, one variable each.
+//   math   - texel index only, no memory read
+//   flash  - plus the read from the texture in flash (through the MMU cache)
+//   psram  - plus the read from a copy of the texture in PSRAM
+void IRAM_ATTR bench_pass(const globe::View& v, const uint16_t* tex, uint32_t* out_sum, uint32_t* out_us) {
+  uint32_t sum = 0;
+  const uint32_t t0 = micros();
+  for (int j = 0; j < g_h; ++j) {
+    int i0, i1;
+    if (!g_disc.row_span(j, g_w, &i0, &i1)) continue;
+    const float py = (g_disc.cy - (j + 0.5f)) * g_disc.inv_r;
+    const float py2 = py * py;
+    for (int i = i0; i <= i1; ++i) {
+      const float px = (i + 0.5f - g_disc.cx) * g_disc.inv_r;
+      float rem = 1.0f - px * px - py2;
+      if (rem < 0.0f) rem = 0.0f;
+      const uint32_t idx = globe::view_to_texel_fast<TW, TH>(v, px, py, sqrtf(rem));
+      sum += tex ? tex[idx] : idx;
+    }
+  }
+  *out_us = micros() - t0;
+  *out_sum = sum;
+}
+
+void run_bench() {
+  long pixels = 0;
+  for (int j = 0; j < g_h; ++j) {
+    int i0, i1;
+    if (g_disc.row_span(j, g_w, &i0, &i1)) pixels += i1 - i0 + 1;
+  }
+  uint16_t* psram_tex = static_cast<uint16_t*>(heap_caps_malloc(TW * TH * 2, MALLOC_CAP_SPIRAM));
+  if (psram_tex) memcpy(psram_tex, g_tex, TW * TH * 2);
+  const globe::View v = globe::View::make(g_lat0, g_lon0);
+  struct {
+    const char* name;
+    const uint16_t* tex;
+  } variants[] = {{"math", nullptr}, {"flash", g_tex}, {"psram", psram_tex}};
+  for (auto& var : variants) {
+    if (var.tex == nullptr && strcmp(var.name, "math") != 0) continue;
+    uint32_t sum, us;
+    bench_pass(v, var.tex, &sum, &us);  // warm-up
+    bench_pass(v, var.tex, &sum, &us);
+    Serial.printf("BENCH %s pixels=%ld ms=%.2f cycles_per_px=%.1f sum=%u\n", var.name, pixels, us / 1000.0f,
+                  us * (float)getCpuFrequencyMhz() / pixels, (unsigned)sum);
+  }
+  heap_caps_free(psram_tex);
+}
+
 }  // namespace
 
 void setup() {
@@ -120,6 +177,7 @@ void setup() {
   M5.begin(cfg);
   Serial.begin(115200);
   pinMode(kButtonLeft, INPUT_PULLUP);
+  attachInterrupt(kButtonLeft, on_button, FALLING);
 
   g_w = M5.Display.width();
   g_h = M5.Display.height();
@@ -136,20 +194,34 @@ void setup() {
                 (int)M5.getBoard(), g_w, g_h, (unsigned)(tex_end - tex_start), (unsigned)(TW * TH * 2), kStripLines,
                 (unsigned)getCpuFrequencyMhz());
   if (!g_buf[0] || !g_buf[1]) Serial.println("ERROR strip buffer allocation failed");
+  delay(1500);  // let a serial reader attach before the benchmark lines go out
+  run_bench();
+  // After M5.begin, so the touch driver's own pin setup does not replace the handler.
+  pinMode(kTouchInt, INPUT_PULLUP);
+  attachInterrupt(kTouchInt, on_touch_int, FALLING);
+  g_touch_edge = false;
+  g_button_edge = false;
   g_stats.t0_ms = millis();
 }
 
 void loop() {
-  // Left button toggles the mode (plain GPIO read, so SPIN does no I2C at all).
-  static bool btn_prev = true;
-  const bool btn = digitalRead(kButtonLeft);
-  if (btn_prev && !btn) {
-    g_mode = (g_mode == Mode::Spin) ? Mode::Touch : Mode::Spin;
+  // Left button: back to SPIN. First contact while spinning: to TOUCH.
+  Mode next = g_mode;
+  if (g_button_edge) {
+    g_button_edge = false;
+    next = Mode::Spin;
+    Serial.println("EVENT button");
+  }
+  if (g_touch_edge) {
+    g_touch_edge = false;
+    if (g_mode == Mode::Spin && next == Mode::Spin) next = Mode::Touch;
+  }
+  if (next != g_mode) {
+    report(millis());  // close the window of the old mode
+    g_mode = next;
     g_was_down = false;
     Serial.printf("MODE %s\n", g_mode == Mode::Spin ? "spin" : "touch");
-    report(millis());
   }
-  btn_prev = btn;
 
   const uint32_t f0 = micros();
   uint32_t touch_sample_us = 0;

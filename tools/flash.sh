@@ -3,6 +3,7 @@
 #
 #   tools/flash.sh            # build, then flash through pi4-deck
 #   HOST=other tools/flash.sh
+#   LOG_SECS=15 tools/flash.sh   # and print serial output for 15 s after the reset
 #
 # The port is pinned by serial number so another ESP32 on the same host is never written.
 set -euo pipefail
@@ -23,3 +24,8 @@ scp -q tools/serial_log.py "$HOST:$REMOTE_DIR/serial_log.py"
 ssh "$HOST" "test -e '$PORT' || { echo 'StopWatch not on $PORT' >&2; exit 1; }; \
   ! fuser '$PORT' 2>/dev/null || { echo 'something holds $PORT' >&2; exit 1; }; \
   $ESPTOOL --chip esp32s3 -p '$PORT' write_flash 0x0 $REMOTE_DIR/firmware.factory.bin"
+
+# LOG_SECS=N: keep reading serial for N seconds right after the reset, so boot lines are caught.
+if [ "${LOG_SECS:-0}" -gt 0 ]; then
+  ssh "$HOST" "python3 $REMOTE_DIR/serial_log.py '$PORT' $LOG_SECS"
+fi
