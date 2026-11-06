@@ -254,6 +254,42 @@ static void test_quadratic_rows_stay_within_one_pixel() {
   }
 }
 
+static void test_tiled_layouts_render_the_same_picture() {
+  // A texture of texel ids in row-major order, and the same ids re-laid out in tiles. The
+  // quadratic renderer must produce identical rows from either, for every tile size.
+  std::vector<uint32_t> lin(TW * TH);
+  for (uint32_t k = 0; k < lin.size(); ++k) lin[k] = k;
+  auto tiled = [&](auto addr) {
+    std::vector<uint32_t> t(TW * TH, 0xFFFFFFFFu);
+    for (int iv = 0; iv < TH; ++iv)
+      for (int iu = 0; iu < TW; ++iu) t[addr(iu, iv)] = uint32_t(iv) * TW + iu;
+    return t;
+  };
+  const auto t4 = tiled([](int u, int v) { return texel_addr<TW, 4>(u, v); });
+  const auto t8 = tiled([](int u, int v) { return texel_addr<TW, 8>(u, v); });
+  const auto t16 = tiled([](int u, int v) { return texel_addr<TW, 16>(u, v); });
+  for (const auto* t : {&t4, &t8, &t16})
+    for (uint32_t x : *t) CHECK(x != 0xFFFFFFFFu, "tiled layout left a hole");
+  const int n = 468;
+  const Disc disc = Disc::make(n, n);
+  std::vector<uint32_t> a(n), b(n);
+  long px = 0, bad = 0;
+  for (const View& v : {View::make(0.3f, 1.0f), View::make(89.0f * kDeg, -2.0f), View::make(-70.0f * kDeg, 3.0f)})
+    for (int j = 0; j < n; j += 3) {
+      int i0, i1;
+      if (!disc.row_span(j, n, &i0, &i1)) continue;
+      render_row_quadratic<TW, TH>(v, disc, j, i0, i1, 64, 0.25f, lin.data(), a.data());
+      render_row_quadratic<TW, TH, uint32_t, 4>(v, disc, j, i0, i1, 64, 0.25f, t4.data(), b.data());
+      for (int i = i0; i <= i1; ++i) bad += a[i] != b[i];
+      render_row_quadratic<TW, TH, uint32_t, 8>(v, disc, j, i0, i1, 64, 0.25f, t8.data(), b.data());
+      for (int i = i0; i <= i1; ++i) bad += a[i] != b[i];
+      render_row_quadratic<TW, TH, uint32_t, 16>(v, disc, j, i0, i1, 64, 0.25f, t16.data(), b.data());
+      for (int i = i0; i <= i1; ++i) bad += a[i] != b[i];
+      px += 3 * (i1 - i0 + 1);
+    }
+  CHECK(bad == 0, "%ld of %ld pixels differ between layouts", bad, px);
+}
+
 int main() {
   test_atan2_accuracy();
   test_fast_scalar_ops();
@@ -266,6 +302,7 @@ int main() {
   test_adaptive_rows_stay_within_one_texel();
   test_adaptive_single_pixel_rows();
   test_quadratic_rows_stay_within_one_pixel();
+  test_tiled_layouts_render_the_same_picture();
   if (g_failures) {
     std::printf("%d failure(s)\n", g_failures);
     return 1;

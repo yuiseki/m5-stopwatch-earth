@@ -189,6 +189,26 @@ inline uint32_t latlon_texel_from_uv(float u, float vv) {
   return static_cast<uint32_t>(iv) * TW + static_cast<uint32_t>(iu);
 }
 
+// Texel address in a texture laid out in square tiles of TS x TS texels (TS a power of two),
+// tiles in row-major order and texels row-major inside a tile. TS = 1 is the plain row-major
+// layout. Tiles keep texels that are close in 2D close in memory: near the poles a screen
+// row walks down the texture as much as across it, and a row-major layout then touches a new
+// cache line for almost every pixel.
+constexpr int ilog2(int x) { return x <= 1 ? 0 : 1 + ilog2(x / 2); }
+template <int TW, int TS>
+inline uint32_t texel_addr(int iu, int iv) {
+  if constexpr (TS == 1) {
+    return static_cast<uint32_t>(iv) * TW + static_cast<uint32_t>(iu);
+  } else {
+    static_assert((TS & (TS - 1)) == 0 && TS <= TW, "tile size must be a power of two");
+    constexpr int s = ilog2(TS);
+    constexpr int tiles_per_row = TW / TS;
+    const uint32_t tile = static_cast<uint32_t>(iv >> s) * tiles_per_row + static_cast<uint32_t>(iu >> s);
+    const uint32_t inner = (static_cast<uint32_t>(iv & (TS - 1)) << s) | static_cast<uint32_t>(iu & (TS - 1));
+    return (tile << (2 * s)) | inner;
+  }
+}
+
 // Screen geometry: a disc of radius r centred at (cx, cy) in pixel coordinates.
 // Pixel (i, j) samples at its centre.
 struct Disc {
@@ -335,8 +355,10 @@ inline int render_row_adaptive(const View& v, const Disc& d, int j, int i0, int 
 // sampling picks any of them equally well. Without this the limb took two thirds of the exact
 // evaluations of a row.
 //
+// TS selects the texture layout (see texel_addr); the texture must be laid out to match.
+//
 // Returns the number of exact evaluations.
-template <int TW, int TH, typename Pixel>
+template <int TW, int TH, typename Pixel, int TS = 1>
 inline int render_row_quadratic(const View& v, const Disc& d, int j, int i0, int i1, int seg, float tol,
                                 const Pixel* tex, Pixel* row) {
   const float py = (d.cy - (static_cast<float>(j) + 0.5f)) * d.inv_r;
@@ -359,7 +381,10 @@ inline int render_row_quadratic(const View& v, const Disc& d, int j, int i0, int
     if (du < -0.5f * TW) du += TW;
     return du;
   };
-  auto put = [&](int i, const UV& p) { row[i] = tex[latlon_texel_from_uv<TW, TH>(p.u, p.v)]; };
+  auto put = [&](int i, const UV& p) {
+    const uint32_t k = latlon_texel_from_uv<TW, TH>(p.u, p.v);
+    row[i] = tex[texel_addr<TW, TS>(static_cast<int>(k % TW), static_cast<int>(k / TW))];
+  };
   struct Job {
     int a, b;    // fills [a, b); exact values known at a, b and m = (a + b) / 2
     UV pa, pb, pm;
@@ -415,7 +440,7 @@ inline int render_row_quadratic(const View& v, const Disc& d, int j, int i0, int
           int iv = V >> 16;
           if (iv > TH - 1) iv = TH - 1;
           if (iv < 0) iv = 0;
-          row[i] = tex[iv * TW + iu];
+          row[i] = tex[texel_addr<TW, TS>(iu, iv)];
           U += dU;
           V += dV;
           dU += ddU;

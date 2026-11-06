@@ -61,7 +61,13 @@ void IRAM_ATTR on_button() { g_button_edge = true; }
 void IRAM_ATTR on_touch_int() { g_touch_edge = true; }
 constexpr float kDeg = globe::kPi / 180.0f;
 
-const uint16_t* g_tex = nullptr;  // big-endian RGB565, as the panel takes it
+const uint16_t* g_tex = nullptr;  // big-endian RGB565, as the panel takes it (flash, row-major)
+// The renderer reads a copy in PSRAM laid out in 4x4 tiles (globe::texel_addr). Near the poles
+// a screen row walks down the texture as much as across it; row-major reads then miss the
+// cache on almost every pixel. Cycles per pixel at view latitude 0 / 89 (one core, quadratic
+// rows): flash row-major 100 / 223, PSRAM row-major 96 / 152, PSRAM 4x4 tiles 106 / 127.
+constexpr int kTile = 4;
+uint16_t* g_tex_tiled = nullptr;  // null if PSRAM could not hold it; then flash is read
 int g_w = 0, g_h = 0;
 globe::Disc g_disc;
 uint16_t* g_buf[2] = {nullptr, nullptr};
@@ -100,7 +106,10 @@ void IRAM_ATTR render_rows(const globe::View& v, int y0, int r0, int r1, uint16_
     }
     if (i0 > 0) memset(row, 0, i0 * 2);
     if (i1 < g_w - 1) memset(row + i1 + 1, 0, (g_w - 1 - i1) * 2);
-    if (g_quadratic) {
+    if (g_quadratic && g_tex_tiled) {
+      globe::render_row_quadratic<TW, TH, uint16_t, kTile>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, g_tex_tiled,
+                                                           row);
+    } else if (g_quadratic) {
       globe::render_row_quadratic<TW, TH>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, g_tex, row);
     } else {
       globe::render_row_adaptive<TW, TH>(v, g_disc, j, i0, i1, kSeg, kTol, g_tex, row);
@@ -248,18 +257,54 @@ void run_bench() {
     Serial.printf("BENCH fill_only_%s ms=%.2f cycles_per_px=%.1f sum=%u\n", tex == g_tex ? "flash" : "psram",
                   us / 1000.0f, us * (float)getCpuFrequencyMhz() / pixels, (unsigned)sum);
   }
-  // Same renderer, view latitude as the only variable.
-  for (float lat : {0.0f, 45.0f, 70.0f, 85.0f, 89.0f}) {
+  // Same renderer, view latitude and texture layout as the variables.
+  auto make_tiled = [&](auto addr) {
+    uint16_t* t = static_cast<uint16_t*>(heap_caps_malloc(TW * TH * 2, MALLOC_CAP_SPIRAM));
+    if (!t) return t;
+    for (int iv = 0; iv < TH; ++iv)
+      for (int iu = 0; iu < TW; ++iu) t[addr(iu, iv)] = g_tex[iv * TW + iu];
+    return t;
+  };
+  uint16_t* t4 = make_tiled([](int u, int v) { return globe::texel_addr<TW, 4>(u, v); });
+  uint16_t* t8 = make_tiled([](int u, int v) { return globe::texel_addr<TW, 8>(u, v); });
+  uint16_t* t16 = make_tiled([](int u, int v) { return globe::texel_addr<TW, 16>(u, v); });
+  for (float lat : {0.0f, 45.0f, 70.0f, 89.0f}) {
     const globe::View vl = globe::View::make(lat * kDeg, g_lon0);
-    for (const uint16_t* tex : {g_tex, (const uint16_t*)psram_tex}) {
-      if (!tex) continue;
-      uint32_t sum, us;
-      bench_pass(vl, tex, kQuadSeg, rowbuf, &sum, &us);
-      bench_pass(vl, tex, kQuadSeg, rowbuf, &sum, &us);
-      Serial.printf("BENCHLAT lat=%.0f tex=%s ms=%.2f cycles_per_px=%.1f\n", lat, tex == g_tex ? "flash" : "psram",
-                    us / 1000.0f, us * (float)getCpuFrequencyMhz() / pixels);
-    }
+    auto run = [&](const char* name, auto row_fn) {
+      uint32_t best = UINT32_MAX, sum = 0;
+      for (int rep = 0; rep < 2; ++rep) {
+        const uint32_t t0 = micros();
+        for (int j = 0; j < g_h; ++j) {
+          int i0, i1;
+          if (!g_disc.row_span(j, g_w, &i0, &i1)) continue;
+          row_fn(vl, j, i0, i1);
+          sum += rowbuf[(i0 + i1) / 2];
+        }
+        const uint32_t us = micros() - t0;
+        if (us < best) best = us;
+      }
+      Serial.printf("BENCHLAT lat=%.0f tex=%s ms=%.2f cycles_per_px=%.1f sum=%u\n", lat, name, best / 1000.0f,
+                    best * (float)getCpuFrequencyMhz() / pixels, (unsigned)sum);
+    };
+    run("flash", [&](const globe::View& v, int j, int i0, int i1) {
+      globe::render_row_quadratic<TW, TH>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, g_tex, rowbuf);
+    });
+    if (psram_tex) run("psram", [&](const globe::View& v, int j, int i0, int i1) {
+      globe::render_row_quadratic<TW, TH>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, psram_tex, rowbuf);
+    });
+    if (t4) run("psram_tile4", [&](const globe::View& v, int j, int i0, int i1) {
+      globe::render_row_quadratic<TW, TH, uint16_t, 4>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, t4, rowbuf);
+    });
+    if (t8) run("psram_tile8", [&](const globe::View& v, int j, int i0, int i1) {
+      globe::render_row_quadratic<TW, TH, uint16_t, 8>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, t8, rowbuf);
+    });
+    if (t16) run("psram_tile16", [&](const globe::View& v, int j, int i0, int i1) {
+      globe::render_row_quadratic<TW, TH, uint16_t, 16>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, t16, rowbuf);
+    });
   }
+  heap_caps_free(t4);
+  heap_caps_free(t8);
+  heap_caps_free(t16);
   heap_caps_free(rowbuf);
 
   // Display transfer: how long does pushImageDMA block, and how long until the DMA is done?
@@ -386,12 +431,18 @@ void setup() {
   g_h = g_out->height();
   g_disc = globe::Disc::make(g_w, g_h);
   g_tex = reinterpret_cast<const uint16_t*>(tex_start);
+  g_tex_tiled = static_cast<uint16_t*>(heap_caps_malloc(TW * TH * 2, MALLOC_CAP_SPIRAM));
+  if (g_tex_tiled) {
+    for (int iv = 0; iv < TH; ++iv)
+      for (int iu = 0; iu < TW; ++iu) g_tex_tiled[globe::texel_addr<TW, kTile>(iu, iv)] = g_tex[iv * TW + iu];
+  }
 
   for (auto& b : g_buf) {
     b = static_cast<uint16_t*>(heap_caps_malloc(g_w * kStripLines * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
   }
   g_out->fillScreen(TFT_BLACK);
 
+  Serial.printf("BOOT texture=%s\n", g_tex_tiled ? "psram_tile4" : "flash");
   Serial.printf("BOOT direct_panel=%d fb=%dx%d\n", g_direct_ok ? 1 : 0, (int)M5.Display.width(), (int)M5.Display.height());
   Serial.printf("BOOT board=%d display=%dx%d texture_bytes=%u expected=%u strip_lines=%d cpu_mhz=%u\n",
                 (int)M5.getBoard(), g_w, g_h, (unsigned)(tex_end - tex_start), (unsigned)(TW * TH * 2), kStripLines,
