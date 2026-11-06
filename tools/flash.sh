@@ -28,5 +28,6 @@ ssh "$HOST" "test -e '$PORT' || { echo 'StopWatch not on $PORT' >&2; exit 1; }; 
 
 # LOG_SECS=N: keep reading serial for N seconds right after the reset, so boot lines are caught.
 if [ "${LOG_SECS:-0}" -gt 0 ]; then
-  ssh "$HOST" "python3 $REMOTE_DIR/serial_log.py '$PORT' $LOG_SECS"
+  mkdir -p ~/logs
+  ssh "$HOST" "python3 $REMOTE_DIR/serial_log.py '$PORT' $LOG_SECS" | tee ~/logs/stopwatch-earth-flash.log
 fi

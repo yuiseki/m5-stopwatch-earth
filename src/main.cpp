@@ -76,8 +76,9 @@ uint16_t* g_buf[2] = {nullptr, nullptr};
 enum class Mode { Spin, Touch };
 Mode g_mode = Mode::Spin;
 
-float g_lat0 = 20.0f * kDeg;
-float g_lon0 = 135.0f * kDeg;
+// Orientation of the globe (any rotation; dragging can take it over a pole and upside down).
+globe::View g_view = globe::View::make(20.0f * kDeg, 135.0f * kDeg);
+constexpr float kBenchLat = 20.0f * kDeg, kBenchLon = 135.0f * kDeg;
 
 // Statistics over one reporting window.
 struct Stats {
@@ -216,7 +217,7 @@ void run_bench() {
   }
   uint16_t* psram_tex = static_cast<uint16_t*>(heap_caps_malloc(TW * TH * 2, MALLOC_CAP_SPIRAM));
   if (psram_tex) memcpy(psram_tex, g_tex, TW * TH * 2);
-  const globe::View v = globe::View::make(g_lat0, g_lon0);
+  const globe::View v = globe::View::make(kBenchLat, kBenchLon);
   uint16_t* rowbuf = static_cast<uint16_t*>(heap_caps_malloc(g_w * 2, MALLOC_CAP_INTERNAL));
   struct {
     const char* name;
@@ -270,7 +271,7 @@ void run_bench() {
   uint16_t* t8 = make_tiled([](int u, int v) { return globe::texel_addr<TW, 8>(u, v); });
   uint16_t* t16 = make_tiled([](int u, int v) { return globe::texel_addr<TW, 16>(u, v); });
   for (float lat : {0.0f, 45.0f, 70.0f, 89.0f}) {
-    const globe::View vl = globe::View::make(lat * kDeg, g_lon0);
+    const globe::View vl = globe::View::make(lat * kDeg, kBenchLon);
     auto run = [&](const char* name, auto row_fn) {
       uint32_t best = UINT32_MAX, sum = 0;
       for (int rep = 0; rep < 2; ++rep) {
@@ -408,16 +409,25 @@ void diag_loop() {
 int panel_power_cycle() {
   constexpr uint8_t kIoe1 = 0x4F, kOutLevel = 0x05, kPanelPower = 0x80, kPanelReset = 0x10;
   Wire.begin(47, 48, 100000);
-  Wire.beginTransmission(kIoe1);
-  Wire.write(kOutLevel);
-  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(kIoe1, (uint8_t)1) != 1) {
+  // Plain write then read with a stop between: a repeated start (endTransmission(false))
+  // failed here with ESP_ERR_INVALID_STATE on Arduino-ESP32 3.3. A few tries, because the
+  // expander may still be busy right after a chip reset.
+  int level = -1;
+  for (int attempt = 0; attempt < 3 && level < 0; ++attempt) {
+    if (attempt) delay(5);
+    Wire.beginTransmission(kIoe1);
+    Wire.write(kOutLevel);
+    if (Wire.endTransmission(true) != 0) continue;
+    if (Wire.requestFrom(kIoe1, (uint8_t)1) != 1) continue;
+    level = Wire.read();
+  }
+  if (level < 0) {
     Wire.end();
     return -1;
   }
-  const uint8_t level = Wire.read();
   Wire.beginTransmission(kIoe1);
   Wire.write(kOutLevel);
-  Wire.write(level & ~(kPanelPower | kPanelReset));
+  Wire.write(static_cast<uint8_t>(level & ~(kPanelPower | kPanelReset)));
   Wire.endTransmission();
   delay(200);
   Wire.end();
@@ -527,7 +537,7 @@ void loop() {
   bool new_touch = false;
 
   if (g_mode == Mode::Spin) {
-    g_lon0 += 1.0f * kDeg;
+    g_view.spin(1.0f * kDeg);
   } else {
     lgfx::touch_point_t tp;
     const uint32_t t = micros();
@@ -537,12 +547,9 @@ void loop() {
     if (n > 0) {
       ++g_stats.touched_frames;
       if (g_was_down && (tp.x != g_last_x || tp.y != g_last_y)) {
-        // Drag: the point under the finger follows it, roughly (radians per pixel at the centre).
-        const float k = 1.0f / g_disc.r;
-        g_lon0 -= (tp.x - g_last_x) * k;
-        g_lat0 += (tp.y - g_last_y) * k;
-        if (g_lat0 > 89.0f * kDeg) g_lat0 = 89.0f * kDeg;
-        if (g_lat0 < -89.0f * kDeg) g_lat0 = -89.0f * kDeg;
+        // Drag: the point under the centre follows the finger, with no limit, so the globe
+        // can be turned over a pole and upside down.
+        g_view.drag(static_cast<float>(tp.x - g_last_x), static_cast<float>(tp.y - g_last_y), g_disc.r);
         new_touch = true;
       }
       g_last_x = tp.x;
@@ -553,8 +560,7 @@ void loop() {
     }
   }
 
-  const globe::View v = globe::View::make(g_lat0, g_lon0);
-  draw_frame(v);
+  draw_frame(g_view);
   const uint32_t done = micros();
   g_stats.frame_us += done - f0;
   ++g_stats.frames;

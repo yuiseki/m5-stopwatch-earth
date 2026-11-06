@@ -290,6 +290,64 @@ static void test_tiled_layouts_render_the_same_picture() {
   CHECK(bad == 0, "%ld of %ld pixels differ between layouts", bad, px);
 }
 
+static void centre_and_top(const View& v, float* clat, float* clon, float* tlat) {
+  float lon;
+  view_to_latlon_ref(v, 0, 0, 1, clat, clon);
+  view_to_latlon_ref(v, 0, 1, 0, tlat, &lon);
+}
+
+static void test_drag_goes_over_the_pole_to_upside_down() {
+  const float r = 234.0f;
+  View v = View::make(0, 0);
+  // Drag down (screen y grows) a quarter turn in small steps: the north pole comes to the centre.
+  for (int k = 0; k < 100; ++k) v.drag(0, kPi / 2 * r / 100, r);
+  float clat, clon, tlat;
+  centre_and_top(v, &clat, &clon, &tlat);
+  CHECK(std::fabs(clat - kPi / 2) < 1e-3f, "quarter turn down: centre lat %g", clat / kDeg);
+  // Another quarter turn: over the pole, the far side of the globe, upside down.
+  for (int k = 0; k < 100; ++k) v.drag(0, kPi / 2 * r / 100, r);
+  centre_and_top(v, &clat, &clon, &tlat);
+  CHECK(std::fabs(clat) < 1e-3f, "half turn down: centre lat %g", clat / kDeg);
+  CHECK(std::fabs(std::fabs(clon) - kPi) < 1e-3f, "half turn down: centre lon %g", clon / kDeg);
+  CHECK(std::fabs(tlat + kPi / 2) < 1e-3f, "half turn down: top of the disc should be the south pole, lat %g",
+        tlat / kDeg);
+}
+
+static void test_drag_right_brings_the_west() {
+  const float r = 234.0f;
+  View v = View::make(0, 0);
+  v.drag(kPi / 2 * r, 0, r);
+  float clat, clon, tlat;
+  centre_and_top(v, &clat, &clon, &tlat);
+  CHECK(std::fabs(clat) < 1e-4f && std::fabs(clon + kPi / 2) < 1e-4f, "drag right: centre (%g, %g)", clat / kDeg,
+        clon / kDeg);
+  CHECK(std::fabs(tlat - kPi / 2) < 1e-4f, "drag right keeps north up, top lat %g", tlat / kDeg);
+}
+
+static void test_spin_equals_turning_longitude() {
+  View a = View::make(20 * kDeg, 135 * kDeg);
+  a.spin(10 * kDeg);
+  const View b = View::make(20 * kDeg, 145 * kDeg);
+  for (int i = 0; i < 9; ++i) CHECK(std::fabs(a.m[i] - b.m[i]) < 1e-5f, "spin m[%d] %g vs %g", i, a.m[i], b.m[i]);
+}
+
+static void test_many_drags_stay_a_rotation() {
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<float> d(-6.0f, 6.0f);
+  View v = View::make(0.4f, 1.2f);
+  for (int k = 0; k < 10000; ++k) {
+    v.drag(d(rng), d(rng), 234.0f);
+    v.spin(0.017f);
+  }
+  float worst = 0;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) {
+      const float dot = v.m[i * 3] * v.m[j * 3] + v.m[i * 3 + 1] * v.m[j * 3 + 1] + v.m[i * 3 + 2] * v.m[j * 3 + 2];
+      worst = std::max(worst, std::fabs(dot - (i == j ? 1.0f : 0.0f)));
+    }
+  CHECK(worst < 1e-5f, "after 10000 drags M M^T is off by %g", worst);
+}
+
 int main() {
   test_atan2_accuracy();
   test_fast_scalar_ops();
@@ -303,6 +361,10 @@ int main() {
   test_adaptive_single_pixel_rows();
   test_quadratic_rows_stay_within_one_pixel();
   test_tiled_layouts_render_the_same_picture();
+  test_drag_goes_over_the_pole_to_upside_down();
+  test_drag_right_brings_the_west();
+  test_spin_equals_turning_longitude();
+  test_many_drags_stay_a_rotation();
   if (g_failures) {
     std::printf("%d failure(s)\n", g_failures);
     return 1;

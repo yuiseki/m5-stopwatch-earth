@@ -22,7 +22,8 @@ touch sample to the end of the frame that shows it.
 
 - Spin mode (at boot): the globe turns by 1 deg per frame and touch is not read over I2C.
 - Touch mode: entered on the first contact (the touch controller's INT line, G13). Dragging
-  turns the globe. The left button (yellow) goes back to spin.
+  turns the globe like a trackball, with no limit: over a pole and on to upside down. The
+  orientation is a rotation matrix (`globe::View`), not a latitude and longitude. The left button (yellow) goes back to spin.
 - The right button (blue) switches between rendering on one core and on both.
 
 ## How it renders

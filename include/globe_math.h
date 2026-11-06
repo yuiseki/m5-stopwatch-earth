@@ -5,8 +5,10 @@
 //
 // Frames
 //   view  : x to the right, y up, z towards the viewer. The visible hemisphere is z >= 0.
-//   world : the globe after rotating by the view centre (lat0, lon0). The pixel at the
-//           disc centre shows (lat0, lon0).
+//   world : fixed to the globe. y is the north pole, the prime meridian is +z, east is +x.
+//           A View is the rotation from view to world (world = M * view), so the globe can
+//           take any orientation, upside down included. View::make(lat0, lon0) gives the
+//           north-up view centred on (lat0, lon0).
 //
 // Texture
 //   Equirectangular, width TW (a power of two) and height TH. Column 0 starts at
@@ -101,29 +103,87 @@ inline float fast_atan2(float y, float x) {
   return y < 0.0f ? -a : a;
 }
 
-// The view centre, with its sine and cosine cached once per frame.
+// Orientation of the globe: world = M * view, M a rotation (rows m[0..2], m[3..5], m[6..8]).
 struct View {
-  float lat0;  // radians
-  float lon0;  // radians
-  float sin_lat0;
-  float cos_lat0;
+  float m[9];
 
+  // North up, (lat0, lon0) at the disc centre: tilt about the view x axis, then turn about
+  // the pole.
   static View make(float lat0, float lon0) {
-    return View{lat0, lon0, std::sin(lat0), std::cos(lat0)};
+    const float sa = std::sin(lat0), ca = std::cos(lat0);
+    const float so = std::sin(lon0), co = std::cos(lon0);
+    // Tilt T: (x, y, z) -> (x, y ca + z sa, z ca - y sa). Turn L about world y by lon0:
+    // (wx, wy, wz) -> (wx co + wz so, wy, -wx so + wz co). M = L * T.
+    return View{{co, -sa * so, ca * so,  //
+                 0.0f, ca, sa,            //
+                 -so, -sa * co, ca * co}};
+  }
+
+  void apply(float x, float y, float z, float* wx, float* wy, float* wz) const {
+    *wx = m[0] * x + m[1] * y + m[2] * z;
+    *wy = m[3] * x + m[4] * y + m[5] * z;
+    *wz = m[6] * x + m[7] * y + m[8] * z;
+  }
+
+  // Turn the globe as a finger drags (dx, dy) screen pixels (y down) on a disc of radius r
+  // pixels: the surface under the centre moves with the finger, by |d| / r radians. In the
+  // view frame that is a rotation Q about the axis (dy, dx, 0); a point fixed on the globe
+  // moves from p to Q p, so M becomes M Q^T. No limits: the globe can go over a pole and on
+  // to upside down.
+  void drag(float dx, float dy, float r) {
+    const float len = std::sqrt(dx * dx + dy * dy);
+    if (len <= 0.0f) return;
+    const float ax = dy / len, ay = dx / len;  // az = 0
+    const float t = len / r, c = std::cos(t), s = std::sin(t), k = 1.0f - c;
+    // Rodrigues for axis (ax, ay, 0).
+    const float q[9] = {c + ax * ax * k, ax * ay * k, ay * s,  //
+                        ax * ay * k, c + ay * ay * k, -ax * s,  //
+                        -ay * s, ax * s, c};
+    float n[9];
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j)  // (M Q^T)_ij = sum_k M_ik Q_jk
+        n[i * 3 + j] = m[i * 3] * q[j * 3] + m[i * 3 + 1] * q[j * 3 + 1] + m[i * 3 + 2] * q[j * 3 + 2];
+    for (int i = 0; i < 9; ++i) m[i] = n[i];
+    orthonormalize();
+  }
+
+  // Turn the globe about its own pole by a radians (the centre's longitude grows by a when
+  // north is up): M becomes L(a) M.
+  void spin(float a) {
+    const float c = std::cos(a), s = std::sin(a);
+    for (int j = 0; j < 3; ++j) {
+      const float x = m[j], z = m[6 + j];
+      m[j] = c * x + s * z;
+      m[6 + j] = -s * x + c * z;
+    }
+  }
+
+  // Undo float drift after many small rotations (Gram-Schmidt on the rows).
+  void orthonormalize() {
+    auto norm = [](float* r) {
+      const float l = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+      r[0] /= l, r[1] /= l, r[2] /= l;
+    };
+    float* a = m;
+    float* b = m + 3;
+    float* c = m + 6;
+    norm(a);
+    const float d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    b[0] -= d * a[0], b[1] -= d * a[1], b[2] -= d * a[2];
+    norm(b);
+    c[0] = a[1] * b[2] - a[2] * b[1];
+    c[1] = a[2] * b[0] - a[0] * b[2];
+    c[2] = a[0] * b[1] - a[1] * b[0];
   }
 };
 
 // Unit-sphere point in the view frame -> (lat, lon) in radians, lon in (-pi, pi].
 // Uses libm. This is the reference the fast path is tested against.
 inline void view_to_latlon_ref(const View& v, float x, float y, float z, float* lat, float* lon) {
-  const float wx = x;
-  const float wy = y * v.cos_lat0 + z * v.sin_lat0;
-  const float wz = z * v.cos_lat0 - y * v.sin_lat0;
+  float wx, wy, wz;
+  v.apply(x, y, z, &wx, &wy, &wz);
   *lat = std::atan2(wy, std::sqrt(wx * wx + wz * wz));
-  float l = v.lon0 + std::atan2(wx, wz);
-  while (l > kPi) l -= 2.0f * kPi;
-  while (l <= -kPi) l += 2.0f * kPi;
-  *lon = l;
+  *lon = std::atan2(wx, wz);
 }
 
 // Texel index for a (lat, lon). The column wraps, the row clamps.
@@ -141,20 +201,15 @@ inline uint32_t latlon_to_texel(float lat, float lon) {
 }
 
 // The per-pixel hot path: view-frame point -> texel index, with fast_atan2.
-// Longitude is carried in turns-free radians and wrapped by the power-of-two mask,
-// so lon0 may be any value (it accumulates while dragging).
 template <int TW, int TH>
 inline uint32_t view_to_texel_fast(const View& v, float x, float y, float z) {
-  const float wx = x;
-  const float wy = y * v.cos_lat0 + z * v.sin_lat0;
-  const float wz = z * v.cos_lat0 - y * v.sin_lat0;
+  float wx, wy, wz;
+  v.apply(x, y, z, &wx, &wy, &wz);
   const float horiz = fast_sqrt(wx * wx + wz * wz);
   const float lat = fast_atan2(wy, horiz);
-  const float lon = v.lon0 + fast_atan2(wx, wz);
+  const float lon = fast_atan2(wx, wz);
   const float u = (lon + kPi) * (TW / (2.0f * kPi));
   const float vv = (0.5f * kPi - lat) * (TH / kPi);
-  // u may be far outside [0, TW) when lon0 has accumulated; floor then mask keeps it right
-  // for |u| < 2^24, which is about 16000 turns of the globe.
   int iu = fast_floor(u) & (TW - 1);
   int iv = static_cast<int>(vv);
   if (iv < 0) iv = 0;
@@ -166,12 +221,11 @@ inline uint32_t view_to_texel_fast(const View& v, float x, float y, float z) {
 // Column iu = floor(u), row iv = min(floor(v), TH - 1) reproduce view_to_texel_fast.
 template <int TW, int TH>
 inline void view_to_uv(const View& v, float x, float y, float z, float* u, float* vv) {
-  const float wx = x;
-  const float wy = y * v.cos_lat0 + z * v.sin_lat0;
-  const float wz = z * v.cos_lat0 - y * v.sin_lat0;
+  float wx, wy, wz;
+  v.apply(x, y, z, &wx, &wy, &wz);
   const float horiz = fast_sqrt(wx * wx + wz * wz);
   const float lat = fast_atan2(wy, horiz);
-  const float lon = v.lon0 + fast_atan2(wx, wz);
+  const float lon = fast_atan2(wx, wz);
   float uu = (lon + kPi) * (TW / (2.0f * kPi));
   uu -= TW * static_cast<float>(fast_floor(uu * (1.0f / TW)));
   if (uu >= TW) uu -= TW;  // rounding can land exactly on TW
