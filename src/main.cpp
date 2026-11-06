@@ -289,6 +289,55 @@ void run_bench() {
 
 }  // namespace
 
+#ifdef DIAG_COLORS
+// Diagnostic: which way of writing reaches the glass? Each colour fills the whole screen for
+// 3 s, in a loop: red via the framebuffer (known good), blue via g_direct.pushImageDMA strips
+// (the renderer's path), green via setWindow/start_qspi/writeBytes on the underlying panel
+// (the framebuffer's own flush, called by hand), white via the framebuffer again.
+lgfx::Panel_AMOLED* g_panel = nullptr;
+void fill_strips_direct(uint16_t be) {
+  for (int k = 0; k < g_w * kStripLines; ++k) g_buf[0][k] = be;
+  g_direct.startWrite();
+  for (int y = 0; y < g_h; y += kStripLines) {
+    const int lines = (y + kStripLines <= g_h) ? kStripLines : (g_h - y);
+    g_direct.pushImageDMA(0, y, g_w, lines, reinterpret_cast<const lgfx::swap565_t*>(g_buf[0]));
+  }
+  g_direct.waitDMA();
+  g_direct.endWrite();
+}
+void fill_strips_manual(uint16_t be) {
+  for (int k = 0; k < g_w * kStripLines; ++k) g_buf[0][k] = be;
+  auto* bus = g_panel->getBus();
+  g_panel->startWrite();
+  for (int y = 0; y < g_h; y += kStripLines) {
+    const int lines = (y + kStripLines <= g_h) ? kStripLines : (g_h - y);
+    g_panel->setWindow(0, y, g_w - 1, y + lines - 1);
+    g_panel->start_qspi();
+    bus->writeBytes(reinterpret_cast<const uint8_t*>(g_buf[0]), g_w * lines * 2, false, true);
+  }
+  bus->wait();
+  g_panel->endWrite();
+}
+void diag_loop() {
+  for (int round = 0;; ++round) {
+    M5.Display.fillScreen(TFT_RED);
+    M5.Display.display();
+    Serial.printf("DIAG %d red framebuffer\n", round);
+    delay(3000);
+    fill_strips_direct(0x1F00);  // blue 0x001F, big-endian
+    Serial.printf("DIAG %d blue direct pushImageDMA\n", round);
+    delay(3000);
+    fill_strips_manual(0xE007);  // green 0x07E0, big-endian
+    Serial.printf("DIAG %d green manual setWindow/start_qspi/writeBytes\n", round);
+    delay(3000);
+    M5.Display.fillScreen(TFT_WHITE);
+    M5.Display.display();
+    Serial.printf("DIAG %d white framebuffer\n", round);
+    delay(3000);
+  }
+}
+#endif
+
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
@@ -336,6 +385,13 @@ void setup() {
                 (int)M5.getBoard(), g_w, g_h, (unsigned)(tex_end - tex_start), (unsigned)(TW * TH * 2), kStripLines,
                 (unsigned)getCpuFrequencyMhz());
   if (!g_buf[0] || !g_buf[1]) Serial.println("ERROR strip buffer allocation failed");
+#ifdef DIAG_COLORS
+  {
+    auto* fb = static_cast<lgfx::Panel_AMOLED_Framebuffer*>(M5.Display.getPanel());
+    g_panel = FbPeek::underlying(fb);
+    diag_loop();
+  }
+#endif
   delay(1500);  // let a serial reader attach before the benchmark lines go out
   run_bench();
   // After M5.begin, so the touch driver's own pin setup does not replace the handler.

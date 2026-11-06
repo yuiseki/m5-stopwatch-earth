@@ -14,8 +14,9 @@ PORT=${PORT:-/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_C4:9E:7E
 ESPTOOL=${ESPTOOL:-'python3 ~/.platformio/packages/tool-esptoolpy/esptool.py'}
 REMOTE_DIR=${REMOTE_DIR:-'~/m5-stopwatch-earth'}
 
-~/.platformio/penv/bin/pio run -e stopwatch
-IMG=.pio/build/stopwatch/firmware.factory.bin
+ENV=${ENV:-stopwatch}
+~/.platformio/penv/bin/pio run -e "$ENV"
+IMG=.pio/build/$ENV/firmware.factory.bin
 [ -f "$IMG" ] || { echo "missing $IMG" >&2; exit 1; }
 
 ssh "$HOST" "mkdir -p $REMOTE_DIR"
