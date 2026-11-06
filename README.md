@@ -1,5 +1,7 @@
 # m5-stopwatch-earth
 
+<img src="docs/cover.jpg" alt="The StopWatch held in a hand, showing East Asia, the Pacific and Australia on the globe" width="480">
+
 NASA Blue Marble on the round 1.75" AMOLED of the M5Stack StopWatch (ESP32-S3R8, CO5300, 468x468
 as M5GFX reports it), as an orthographic globe drawn by a software renderer. Drag to turn it.
 
