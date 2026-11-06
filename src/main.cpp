@@ -248,6 +248,18 @@ void run_bench() {
     Serial.printf("BENCH fill_only_%s ms=%.2f cycles_per_px=%.1f sum=%u\n", tex == g_tex ? "flash" : "psram",
                   us / 1000.0f, us * (float)getCpuFrequencyMhz() / pixels, (unsigned)sum);
   }
+  // Same renderer, view latitude as the only variable.
+  for (float lat : {0.0f, 45.0f, 70.0f, 85.0f, 89.0f}) {
+    const globe::View vl = globe::View::make(lat * kDeg, g_lon0);
+    for (const uint16_t* tex : {g_tex, (const uint16_t*)psram_tex}) {
+      if (!tex) continue;
+      uint32_t sum, us;
+      bench_pass(vl, tex, kQuadSeg, rowbuf, &sum, &us);
+      bench_pass(vl, tex, kQuadSeg, rowbuf, &sum, &us);
+      Serial.printf("BENCHLAT lat=%.0f tex=%s ms=%.2f cycles_per_px=%.1f\n", lat, tex == g_tex ? "flash" : "psram",
+                    us / 1000.0f, us * (float)getCpuFrequencyMhz() / pixels);
+    }
+  }
   heap_caps_free(rowbuf);
 
   // Display transfer: how long does pushImageDMA block, and how long until the DMA is done?
