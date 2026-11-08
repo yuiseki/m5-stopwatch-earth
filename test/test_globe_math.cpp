@@ -365,6 +365,303 @@ static void test_equator_reset_keeps_the_facing_longitude() {
   CHECK(std::fabs(rlat) < 1e-5f && std::fabs(rtlat - kPi / 2) < 1e-5f, "reset from the pole");
 }
 
+
+// --- Scalar helpers at their edges -------------------------------------------------------
+
+static void test_fast_rsqrt_recip2_and_atan01() {
+  float w_rsqrt = 0, w_recip2 = 0, w_atan = 0;
+  for (float x = 1e-4f; x < 1e4f; x *= 1.013f) {
+    w_rsqrt = std::max(w_rsqrt, std::fabs(fast_rsqrt(x) * std::sqrt(x) - 1.0f));
+    w_recip2 = std::max(w_recip2, std::fabs(fast_recip2(x) * x - 1.0f));
+  }
+  for (int i = 0; i <= 10000; ++i) {
+    const float t = i / 10000.0f;
+    w_atan = std::max(w_atan, std::fabs(atan01(t) - std::atan(t)));
+  }
+  CHECK(w_rsqrt < 1e-5f, "fast_rsqrt rel error %g", w_rsqrt);
+  CHECK(w_recip2 < 3e-4f, "fast_recip2 rel error %g (documented about 2e-4)", w_recip2);
+  CHECK(w_atan < 2e-5f, "atan01 error %g rad (documented about 1e-5)", w_atan);
+  CHECK(atan01(0.0f) == 0.0f, "atan01(0)");
+}
+
+static void test_atan2_quadrants_and_axes() {
+  const float pts[][2] = {{1, 1}, {1, -1}, {-1, -1}, {-1, 1}, {0, 1}, {0, -1}, {1, 0}, {-1, 0},
+                          {1e-6f, -1}, {-1e-6f, -1}, {3, 1e-7f}, {-2, 5}};
+  for (const auto& p : pts) {
+    const float a = fast_atan2(p[0], p[1]), r = std::atan2(p[0], p[1]);
+    // At (+-0, -1) the two answers are pi and -pi, the same direction.
+    const float d = std::fabs(a - r);
+    CHECK(d < 2e-5f || std::fabs(d - 2 * kPi) < 2e-5f, "fast_atan2(%g, %g) = %g, want %g", p[0], p[1], a, r);
+  }
+}
+
+static void test_fast_floor_near_integers() {
+  for (float x : {-1.0f, -0.999999f, -1e-7f, 0.0f, 1e-7f, 0.999999f, 1023.9999f, 1024.0f, -1024.0001f}) {
+    CHECK(fast_floor(x) == (int)std::floor(x), "fast_floor(%.7g) = %d", x, fast_floor(x));
+  }
+}
+
+// --- Texture addressing ------------------------------------------------------------------
+
+static void test_ilog2() {
+  static_assert(ilog2(1) == 0 && ilog2(2) == 1 && ilog2(4) == 2 && ilog2(16) == 4 && ilog2(1024) == 10, "ilog2");
+}
+
+template <int TS>
+static void check_texel_addr_is_a_permutation() {
+  std::vector<uint8_t> hit(TW * TH, 0);
+  long out = 0, dup = 0;
+  for (int iv = 0; iv < TH; ++iv)
+    for (int iu = 0; iu < TW; ++iu) {
+      const uint32_t a = texel_addr<TW, TS>(iu, iv);
+      if (a >= (uint32_t)(TW * TH)) {
+        ++out;
+        continue;
+      }
+      dup += hit[a]++ != 0;
+    }
+  CHECK(out == 0 && dup == 0, "TS %d: %ld addresses out of range, %ld shared", TS, out, dup);
+}
+
+// CHECK is a macro: template arguments with commas go through these.
+static uint32_t addr1(int iu, int iv) { return texel_addr<TW, 1>(iu, iv); }
+static uint32_t addr4(int iu, int iv) { return texel_addr<TW, 4>(iu, iv); }
+
+static void test_texel_addr() {
+  for (int iv : {0, 1, 255, 511})
+    for (int iu : {0, 1, 3, 4, 1023}) CHECK(addr1(iu, iv) == (uint32_t)(iv * TW + iu), "TS 1 is row-major");
+  check_texel_addr_is_a_permutation<1>();
+  check_texel_addr_is_a_permutation<2>();
+  check_texel_addr_is_a_permutation<4>();
+  check_texel_addr_is_a_permutation<8>();
+  check_texel_addr_is_a_permutation<16>();
+  // A 4x4 tile is 16 consecutive texels (32 bytes, one cache line holds two tiles).
+  for (int iv = 0; iv < 4; ++iv)
+    for (int iu = 0; iu < 4; ++iu) {
+      const uint32_t base = addr4(8, 12);
+      CHECK(addr4(8 + iu, 12 + iv) == base + iv * 4 + iu, "tile (2,3) texel (%d,%d)", iu, iv);
+    }
+  CHECK(addr4(4, 0) == 16, "second tile starts after the first 16 texels");
+  CHECK(addr4(0, 4) == (TW / 4) * 16, "second tile row starts after a full row of tiles");
+}
+
+static void test_tile_texture_copies_every_texel() {
+  std::vector<uint16_t> src(TW * TH), dst(TW * TH, 0xDEAD);
+  for (int i = 0; i < TW * TH; ++i) src[i] = (uint16_t)(i * 2654435761u >> 16);
+  tile_texture<TW, TH, 4>(src.data(), dst.data());
+  long bad = 0;
+  for (int iv = 0; iv < TH; ++iv)
+    for (int iu = 0; iu < TW; ++iu) bad += dst[texel_addr<TW, 4>(iu, iv)] != src[iv * TW + iu];
+  CHECK(bad == 0, "%ld texels misplaced by tile_texture", bad);
+}
+
+static void test_latlon_to_texel_clamps_beyond_the_poles() {
+  CHECK(tex_ref(kPi / 2 + 0.1f, 0.0f) / TW == 0, "above the north pole clamps to row 0");
+  CHECK(tex_ref(-kPi / 2 - 0.1f, 0.0f) / TW == TH - 1, "below the south pole clamps to the last row");
+  CHECK(tex_ref(0.0f, -kPi - 0.001f) % TW == TW - 1, "just west of -180 wraps to the last column");
+  CHECK(tex_ref(0.0f, -kPi - 0.01f) % TW == TW - 2, "0.01 rad west of -180 is 1.6 texels in");
+}
+
+static void test_view_to_uv_matches_view_to_texel_fast() {
+  const View views[] = {View::make(0, 0), View::make(20 * kDeg, 135 * kDeg), View::make(89 * kDeg, -179 * kDeg),
+                        View::make(-60 * kDeg, 180 * kDeg)};
+  const Disc d = Disc::make(256, 256);
+  long bad = 0, range = 0, n = 0;
+  for (const View& v : views)
+    for (int j = 0; j < 256; ++j)
+      for (int i = 0; i < 256; ++i) {
+        float x, y, z, u, vv;
+        if (!d.pixel_to_view(i, j, &x, &y, &z)) continue;
+        view_to_uv<TW, TH>(v, x, y, z, &u, &vv);
+        range += !(u >= 0.0f && u < TW && vv >= 0.0f && vv <= TH);
+        const uint32_t from_uv = latlon_texel_from_uv<TW, TH>(u, vv);
+        bad += from_uv != tex_fast(v, x, y, z);
+        ++n;
+      }
+  CHECK(range == 0, "%ld of %ld uv out of [0,TW) x [0,TH]", range, n);
+  CHECK(bad == 0, "%ld of %ld pixels: view_to_uv + latlon_texel_from_uv differ from view_to_texel_fast", bad, n);
+}
+
+// --- Screen geometry ---------------------------------------------------------------------
+
+static void test_disc_geometry() {
+  const Disc d = Disc::make(468, 400);
+  CHECK(d.r == 200.0f && d.cx == 234.0f && d.cy == 200.0f, "non-square screen: r %g c (%g,%g)", d.r, d.cx, d.cy);
+  float x, y, z;
+  CHECK(!d.pixel_to_view(0, 0, &x, &y, &z), "corner is outside the disc");
+  CHECK(!d.pixel_to_view(20, 200, &x, &y, &z), "left margin of a wide screen is outside");
+  float worst = 0;
+  for (int j = 0; j < 400; j += 7)
+    for (int i = 0; i < 468; i += 5)
+      if (d.pixel_to_view(i, j, &x, &y, &z)) {
+        worst = std::max(worst, std::fabs(x * x + y * y + z * z - 1.0f));
+        CHECK(z >= 0.0f, "front hemisphere only");
+      }
+  CHECK(worst < 1e-5f, "points not on the unit sphere, off by %g", worst);
+  d.pixel_to_view(233, 0, &x, &y, &z);
+  CHECK(y > 0.99f, "row 0 is the top (y up), y %g", y);
+}
+
+static void test_blank_outside_disc() {
+  const int W = 64;
+  const Disc d = Disc::make(W, W);
+  std::vector<uint16_t> row(W);
+  for (int j : {0, 1, 10, 32, 63}) {
+    std::fill(row.begin(), row.end(), 0x5555);
+    int i0 = -1, i1 = -1;
+    const bool in = blank_outside_disc(d, j, W, row.data(), &i0, &i1);
+    int s0, s1;
+    const bool want = d.row_span(j, W, &s0, &s1);
+    CHECK(in == want, "row %d: in %d, row_span %d", j, in, want);
+    for (int i = 0; i < W; ++i) {
+      const bool inside = in && i >= s0 && i <= s1;
+      CHECK(row[i] == (inside ? 0x5555 : 0), "row %d col %d: %04x", j, i, row[i]);
+    }
+    if (in) CHECK(i0 == s0 && i1 == s1, "row %d span [%d,%d], want [%d,%d]", j, i0, i1, s0, s1);
+  }
+  // A strip row below the disc (screen taller than wide) is all black.
+  const Disc tall = Disc::make(32, 48);
+  std::fill(row.begin(), row.begin() + 32, 0x5555);
+  int i0, i1;
+  CHECK(!blank_outside_disc(tall, 2, 32, row.data(), &i0, &i1), "row 2 of a 32x48 screen misses the disc");
+  CHECK(std::all_of(row.begin(), row.begin() + 32, [](uint16_t p) { return p == 0; }), "missed row is black");
+}
+
+// --- Rotations ---------------------------------------------------------------------------
+
+static float rotation_error(const View& v) {
+  float worst = 0;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) {
+      float s = 0;
+      for (int k = 0; k < 3; ++k) s += v.m[i * 3 + k] * v.m[j * 3 + k];
+      worst = std::max(worst, std::fabs(s - (i == j ? 1.0f : 0.0f)));
+    }
+  const float* m = v.m;
+  const float det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) +
+                    m[2] * (m[3] * m[7] - m[4] * m[6]);
+  return std::max(worst, std::fabs(det - 1.0f));
+}
+
+static float max_diff(const View& a, const View& b) {
+  float w = 0;
+  for (int i = 0; i < 9; ++i) w = std::max(w, std::fabs(a.m[i] - b.m[i]));
+  return w;
+}
+
+static void test_make_is_a_proper_rotation() {
+  float worst = 0;
+  for (float lat = -90; lat <= 90; lat += 15)
+    for (float lon = -180; lon <= 180; lon += 30) worst = std::max(worst, rotation_error(View::make(lat * kDeg, lon * kDeg)));
+  CHECK(worst < 1e-6f, "View::make not a rotation with det +1, off by %g", worst);
+}
+
+static void test_drag_and_spin_undo() {
+  const View v0 = View::make(35 * kDeg, -70 * kDeg);
+  View v = v0;
+  v.drag(0, 0, 200);
+  CHECK(max_diff(v, v0) == 0.0f, "a zero drag changes nothing");
+  v.drag(37, -12, 200);
+  CHECK(max_diff(v, v0) > 0.05f, "a drag turns the globe");
+  v.drag(-37, 12, 200);
+  CHECK(max_diff(v, v0) < 1e-5f, "dragging back undoes the drag, off by %g", max_diff(v, v0));
+  v.spin(0.3f);
+  v.spin(-0.3f);
+  CHECK(max_diff(v, v0) < 1e-5f, "spinning back undoes the spin, off by %g", max_diff(v, v0));
+  // A drag by r pixels turns the globe by one radian: the centre moves by 1 rad of latitude.
+  View w = View::make(0, 0);
+  w.drag(0, -100, 100);  // finger up: the surface below comes to the centre
+  float lat, lon;
+  view_to_latlon_ref(w, 0, 0, 1, &lat, &lon);
+  CHECK(std::fabs(lat + 1.0f) < 1e-4f && std::fabs(lon) < 1e-4f, "drag up by r: centre (%g, %g) rad", lat, lon);
+}
+
+static void test_spin_turns_about_the_pole() {
+  View v = View::make(30 * kDeg, 10 * kDeg);
+  v.drag(25, 40, 150);  // any orientation, north no longer up
+  float wx0, wy0, wz0;
+  v.apply(0.3f, -0.4f, std::sqrt(1 - 0.25f), &wx0, &wy0, &wz0);
+  v.spin(0.7f);
+  float wx1, wy1, wz1;
+  v.apply(0.3f, -0.4f, std::sqrt(1 - 0.25f), &wx1, &wy1, &wz1);
+  CHECK(std::fabs(wy1 - wy0) < 1e-6f, "spin keeps every latitude: wy %g -> %g", wy0, wy1);
+  CHECK(rotation_error(v) < 1e-5f, "spin keeps a rotation");
+}
+
+static void test_orthonormalize_repairs_drift() {
+  View v = View::make(10 * kDeg, 20 * kDeg);
+  const View v0 = v;
+  for (int i = 0; i < 9; ++i) v.m[i] *= 1.0f + 1e-3f * (i - 4);
+  CHECK(rotation_error(v) > 1e-3f, "perturbation should be visible");
+  v.orthonormalize();
+  CHECK(rotation_error(v) < 1e-6f, "orthonormalize leaves error %g", rotation_error(v));
+  CHECK(max_diff(v, v0) < 5e-3f, "and stays close to the original, %g", max_diff(v, v0));
+}
+
+static void test_equator_reset_from_upside_down() {
+  View v = View::make(0, 40 * kDeg);
+  v.drag(0, kPi * 100, 100);  // half a turn over the pole
+  float clat, clon, tlat;
+  centre_and_top(v, &clat, &clon, &tlat);
+  CHECK(tlat < -kPi / 2 + 1e-3f, "precondition: upside down, top lat %g", tlat / kDeg);
+  const View r = v.equator_reset();
+  float rlat, rlon, rtlat;
+  centre_and_top(r, &rlat, &rlon, &rtlat);
+  CHECK(std::fabs(rlat) < 1e-5f && std::fabs(rtlat - kPi / 2) < 1e-5f, "reset from upside down: lat %g top %g",
+        rlat / kDeg, rtlat / kDeg);
+  CHECK(std::fabs(rlon - clon) < 1e-3f, "keeps the facing longitude %g, got %g", clon / kDeg, rlon / kDeg);
+}
+
+// --- render_row: the exact reference renderer of the boot bench and tools/interp_eval.cpp ----
+//
+// Its step > 1 mode (linear between anchors, exact where u or v moves faster than max_rate
+// texels per pixel) is the first-cut design. A rate limit does not bound the bending of the
+// mapping, so it is only checked here for what it promises: with every rate above max_rate it
+// is the exact renderer, and it never writes outside [i0, i1].
+
+static void test_render_row() {
+  const int N = 200;  // on this disc u moves more than 1.5 texels per pixel everywhere
+  const Disc d = Disc::make(N, N);
+  std::vector<uint32_t> tex(TW * TH);
+  for (uint32_t i = 0; i < tex.size(); ++i) tex[i] = i;
+  std::vector<uint32_t> exact(N + 2), stepped(N + 2);
+  long far = 0, diff = 0, fallback_diff = 0, px = 0;
+  for (const View& v : {View::make(20 * kDeg, 135 * kDeg), View::make(70 * kDeg, 0)})
+    for (int j = 0; j < N; ++j) {
+      int i0, i1;
+      if (!d.row_span(j, N, &i0, &i1)) continue;
+      std::fill(exact.begin(), exact.end(), 0xFFFFFFFFu);
+      std::fill(stepped.begin(), stepped.end(), 0xFFFFFFFFu);
+      render_row<TW, TH>(v, d, j, i0, i1, 1, 0.0f, tex.data(), exact.data());
+      render_row<TW, TH>(v, d, j, i0, i1, 8, 0.5f, tex.data(), stepped.data());
+      for (int i = i0; i <= i1; ++i) {
+        float x, y, z;
+        if (!d.pixel_to_view(i, j, &x, &y, &z)) continue;
+        const uint32_t f = tex_fast(v, x, y, z);
+        // render_row takes z through fast_sqrt, pixel_to_view through std::sqrt: a pixel on a
+        // texel boundary may land one texel over.
+        const int du = std::abs((int)(exact[i] % TW) - (int)(f % TW));
+        const int dv = std::abs((int)(exact[i] / TW) - (int)(f / TW));
+        far += std::min(du, TW - du) > 1 || dv > 1;
+        diff += exact[i] != f;
+        fallback_diff += stepped[i] != exact[i];
+        ++px;
+      }
+      for (auto* b : {&exact, &stepped}) {
+        if (i0 > 0) CHECK((*b)[i0 - 1] == 0xFFFFFFFFu, "wrote before i0 on row %d", j);
+        CHECK((*b)[i1 + 1] == 0xFFFFFFFFu, "wrote past i1 on row %d", j);
+      }
+    }
+  CHECK(far == 0 && diff * 1000 < px, "step 1 vs view_to_texel_fast: %ld differ, %ld by more than a texel, of %ld",
+        diff, far, px);
+  CHECK(fallback_diff == 0, "step 8 with every rate above max_rate should be exact, %ld pixels differ", fallback_diff);
+
+  // A single-pixel row.
+  std::fill(stepped.begin(), stepped.end(), 0xFFFFFFFFu);
+  render_row<TW, TH>(View::make(0, 0), d, 100, 50, 50, 8, 100.0f, tex.data(), stepped.data());
+  CHECK(stepped[50] != 0xFFFFFFFFu && stepped[49] == 0xFFFFFFFFu && stepped[51] == 0xFFFFFFFFu, "single pixel row");
+}
+
 int main() {
   test_atan2_accuracy();
   test_fast_scalar_ops();
@@ -383,6 +680,22 @@ int main() {
   test_spin_equals_turning_longitude();
   test_many_drags_stay_a_rotation();
   test_equator_reset_keeps_the_facing_longitude();
+  test_fast_rsqrt_recip2_and_atan01();
+  test_atan2_quadrants_and_axes();
+  test_fast_floor_near_integers();
+  test_ilog2();
+  test_texel_addr();
+  test_tile_texture_copies_every_texel();
+  test_latlon_to_texel_clamps_beyond_the_poles();
+  test_view_to_uv_matches_view_to_texel_fast();
+  test_disc_geometry();
+  test_blank_outside_disc();
+  test_make_is_a_proper_rotation();
+  test_drag_and_spin_undo();
+  test_spin_turns_about_the_pole();
+  test_orthonormalize_repairs_drift();
+  test_equator_reset_from_upside_down();
+  test_render_row();
   if (g_failures) {
     std::printf("%d failure(s)\n", g_failures);
     return 1;

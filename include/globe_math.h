@@ -271,6 +271,14 @@ inline uint32_t texel_addr(int iu, int iv) {
   }
 }
 
+// Copy a row-major texture into the TS x TS tiled layout of texel_addr. Done once at boot, from
+// flash into PSRAM.
+template <int TW, int TH, int TS, typename Pixel>
+inline void tile_texture(const Pixel* src, Pixel* dst) {
+  for (int iv = 0; iv < TH; ++iv)
+    for (int iu = 0; iu < TW; ++iu) dst[texel_addr<TW, TS>(iu, iv)] = src[iv * TW + iu];
+}
+
 // Screen geometry: a disc of radius r centred at (cx, cy) in pixel coordinates.
 // Pixel (i, j) samples at its centre.
 struct Disc {
@@ -306,6 +314,20 @@ struct Disc {
     return true;
   }
 };
+
+// Row j of a frame `width` pixels wide: black (0) outside the disc. Returns false, with the
+// whole row black, when the row misses the disc; otherwise the span [i0, i1] left for the
+// renderer, which this does not touch.
+template <typename Pixel>
+inline bool blank_outside_disc(const Disc& d, int j, int width, Pixel* row, int* i0, int* i1) {
+  if (!d.row_span(j, width, i0, i1)) {
+    for (int i = 0; i < width; ++i) row[i] = 0;
+    return false;
+  }
+  for (int i = 0; i < *i0; ++i) row[i] = 0;
+  for (int i = *i1 + 1; i < width; ++i) row[i] = 0;
+  return true;
+}
 
 // One row by adaptive subdivision, pixels [i0, i1] of row j, written to row[i0..i1].
 //

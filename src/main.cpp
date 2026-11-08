@@ -18,8 +18,11 @@
 #include <M5Unified.h>
 #include <Wire.h>
 #include <esp_heap_caps.h>
+
+#include <type_traits>
 #include <lgfx/v1/panel/Panel_CO5300.hpp>  // Panel_AMOLED and its framebuffer (needs LGFX_USE_QSPI, set by M5GFX on ESP32-S3)
 
+#include "frame.h"
 #include "globe_math.h"
 
 extern const uint8_t tex_start[] asm("_binary_data_earth_1024x512_rgb565be_start");
@@ -92,10 +95,7 @@ struct Stats {
   uint64_t frame_us = 0;    // wall time per frame, start to DMA done
   uint64_t touch_us = 0;    // time in the touch read
   uint32_t touched_frames = 0;
-  uint32_t lat_n = 0;       // frames that carried a new touch position
-  uint64_t lat_sum_us = 0;
-  uint32_t lat_min_us = UINT32_MAX;
-  uint32_t lat_max_us = 0;
+  frame::Latency lat;       // over the frames that carried a new touch position
   uint32_t t0_ms = 0;
 } g_stats;
 
@@ -106,12 +106,7 @@ void IRAM_ATTR render_rows(const globe::View& v, int y0, int r0, int r1, uint16_
     const int j = y0 + r;
     uint16_t* row = buf + r * g_w;
     int i0, i1;
-    if (!g_disc.row_span(j, g_w, &i0, &i1)) {
-      memset(row, 0, g_w * 2);
-      continue;
-    }
-    if (i0 > 0) memset(row, 0, i0 * 2);
-    if (i1 < g_w - 1) memset(row + i1 + 1, 0, (g_w - 1 - i1) * 2);
+    if (!globe::blank_outside_disc(g_disc, j, g_w, row, &i0, &i1)) continue;
     if (g_quadratic && g_tex_tiled) {
       globe::render_row_quadratic<TW, TH, uint16_t, kTile>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, g_tex_tiled,
                                                            row);
@@ -147,10 +142,10 @@ void draw_frame(const globe::View& v) {
   int b = 0;
   g_out->startWrite();
   for (int y = 0; y < g_h; y += kStripLines) {
-    const int lines = (y + kStripLines <= g_h) ? kStripLines : (g_h - y);
+    const int lines = frame::strip_lines(y, g_h, kStripLines);
+    const int split = frame::core_split(lines, g_cores);
     const uint32_t t = micros();
-    if (g_cores == 2 && lines > 1) {
-      const int split = lines / 2;
+    if (split < lines) {
       g_job = Job{v, y, split, lines, g_buf[b]};
       xTaskNotifyGive(g_worker);
       render_rows(v, y, 0, split, g_buf[b]);
@@ -183,9 +178,8 @@ void report(uint32_t now_ms) {
       "STAT mode=%s cores=%d frames=%u fps=%.2f render_ms=%.2f push_ms=%.2f frame_ms=%.2f touch_ms=%.3f touched=%u "
       "lat_n=%u lat_avg_ms=%.2f lat_min_ms=%.2f lat_max_ms=%.2f heap=%u psram=%u\n",
       g_mode == Mode::Spin ? "spin" : "touch", g_cores, s.frames, s.frames / secs, s.render_us / n / 1000.0f,
-      s.push_us / n / 1000.0f, s.frame_us / n / 1000.0f, s.touch_us / n / 1000.0f, s.touched_frames, s.lat_n,
-      s.lat_n ? s.lat_sum_us / (float)s.lat_n / 1000.0f : 0.0f, s.lat_n ? s.lat_min_us / 1000.0f : 0.0f,
-      s.lat_max_us / 1000.0f, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+      s.push_us / n / 1000.0f, s.frame_us / n / 1000.0f, s.touch_us / n / 1000.0f, s.touched_frames, s.lat.n,
+      s.lat.avg_us() / 1000.0f, s.lat.min_us_or_zero() / 1000.0f, s.lat.max_us / 1000.0f, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
       (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
   s = Stats{};
   s.t0_ms = now_ms;
@@ -264,16 +258,14 @@ void run_bench() {
                   us / 1000.0f, us * (float)getCpuFrequencyMhz() / pixels, (unsigned)sum);
   }
   // Same renderer, view latitude and texture layout as the variables.
-  auto make_tiled = [&](auto addr) {
+  auto make_tiled = [&](auto tile) {
     uint16_t* t = static_cast<uint16_t*>(heap_caps_malloc(TW * TH * 2, MALLOC_CAP_SPIRAM));
-    if (!t) return t;
-    for (int iv = 0; iv < TH; ++iv)
-      for (int iu = 0; iu < TW; ++iu) t[addr(iu, iv)] = g_tex[iv * TW + iu];
+    if (t) globe::tile_texture<TW, TH, decltype(tile)::value>(g_tex, t);
     return t;
   };
-  uint16_t* t4 = make_tiled([](int u, int v) { return globe::texel_addr<TW, 4>(u, v); });
-  uint16_t* t8 = make_tiled([](int u, int v) { return globe::texel_addr<TW, 8>(u, v); });
-  uint16_t* t16 = make_tiled([](int u, int v) { return globe::texel_addr<TW, 16>(u, v); });
+  uint16_t* t4 = make_tiled(std::integral_constant<int, 4>{});
+  uint16_t* t8 = make_tiled(std::integral_constant<int, 8>{});
+  uint16_t* t16 = make_tiled(std::integral_constant<int, 16>{});
   for (float lat : {0.0f, 45.0f, 70.0f, 89.0f}) {
     const globe::View vl = globe::View::make(lat * kDeg, kBenchLon);
     auto run = [&](const char* name, auto row_fn) {
@@ -476,10 +468,7 @@ void setup() {
   g_disc = globe::Disc::make(g_w, g_h);
   g_tex = reinterpret_cast<const uint16_t*>(tex_start);
   g_tex_tiled = static_cast<uint16_t*>(heap_caps_malloc(TW * TH * 2, MALLOC_CAP_SPIRAM));
-  if (g_tex_tiled) {
-    for (int iv = 0; iv < TH; ++iv)
-      for (int iu = 0; iu < TW; ++iu) g_tex_tiled[globe::texel_addr<TW, kTile>(iu, iv)] = g_tex[iv * TW + iu];
-  }
+  if (g_tex_tiled) globe::tile_texture<TW, TH, kTile>(g_tex, g_tex_tiled);
 
   for (auto& b : g_buf) {
     b = static_cast<uint16_t*>(heap_caps_malloc(g_w * kStripLines * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
@@ -571,10 +560,7 @@ void loop() {
   ++g_stats.frames;
   if (new_touch) {
     const uint32_t lat = done - touch_sample_us;
-    ++g_stats.lat_n;
-    g_stats.lat_sum_us += lat;
-    if (lat < g_stats.lat_min_us) g_stats.lat_min_us = lat;
-    if (lat > g_stats.lat_max_us) g_stats.lat_max_us = lat;
+    g_stats.lat.add(lat);
   }
 
   const uint32_t now = millis();

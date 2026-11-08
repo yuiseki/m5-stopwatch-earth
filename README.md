@@ -11,7 +11,7 @@ latitude and longitude and takes its texel.
 
 ## Build, flash, measure
 
-    make test                       # host tests of the projection math (include/globe_math.h)
+    make test                       # host tests (see Tests below)
     tools/flash.sh                  # build, copy to pi4-deck, write over USB (port pinned by MAC)
     LOG_SECS=15 tools/flash.sh      # ... and print the serial output for 15 s after the reset
     ENV=diag tools/flash.sh         # colour test of the display write paths
@@ -29,6 +29,25 @@ touch sample to the end of the frame that shows it.
 - The left button (yellow) also turns the globe north up with the equator at the centre,
   keeping the longitude that faces the viewer.
 - The right button (blue) switches between rendering on one core and on both.
+
+## Tests
+
+`make test` runs on the host, without the board:
+
+- `test/test_globe_math.cpp` (`include/globe_math.h`): the multiply-only scalar math against
+  libm, the projection and texel addressing (every tiled layout is a permutation, the boot copy
+  puts every texel where the renderer reads it), the disc geometry and the black outside it, the
+  row renderers against the exact mapping (within one texel or one screen pixel, no writes
+  outside the span), and the rotations (proper rotations, drags and spins undo, over the pole
+  to upside down, the left-button reset from any orientation).
+- `test/test_frame.cpp` (`include/frame.h`): strips and the split between the two cores draw
+  every screen row exactly once; the touch latency statistics.
+- `test/test_tools.py`: `tools/make_texture.py` (big-endian RGB565, north-west first, rejects
+  sources that are not 2:1) and `tools/serial_log.py` against a pseudo-terminal (lines split
+  across reads, the port left at baud 0 without hang-up). Needs Pillow.
+
+What needs the board (DMA to the panel, touch, buttons, the boot power cycle) is measured by
+the `BENCH` and `STAT` lines instead.
 
 ## How it renders
 
