@@ -542,87 +542,18 @@ inline int render_row_quadratic(const View& v, const Disc& d, int j, int i0, int
   return evals;
 }
 
-// One row of the disc, pixels [i0, i1] of row j, written to row[i0..i1].
-//
-// The exact mapping (view_to_texel_fast) costs two atan2, two sqrt and a division per pixel.
-// Here it is evaluated only at anchors every `step` pixels; between anchors the texel
-// coordinates are interpolated linearly in 16.16 fixed point. A segment is computed exactly
-// instead when u or v moves faster than `max_rate` texels per pixel, which is where the
-// mapping bends hard: around the poles (longitude sweeps) and along the limb.
-//
-// step = 1 is the exact renderer.
+// One row of the disc, pixels [i0, i1] of row j, written to row[i0..i1], every pixel by the
+// exact mapping (view_to_texel_fast: two atan2, a sqrt and a reciprocal). The reference the
+// interpolating renderers are measured against, and the first cut's renderer.
 template <int TW, int TH, typename Pixel>
-inline void render_row(const View& v, const Disc& d, int j, int i0, int i1, int step, float max_rate,
-                       const Pixel* tex, Pixel* row) {
+inline void render_row_exact(const View& v, const Disc& d, int j, int i0, int i1, const Pixel* tex, Pixel* row) {
   const float py = (d.cy - (static_cast<float>(j) + 0.5f)) * d.inv_r;
   const float py2 = py * py;
-  auto view_z = [&](int i, float* px) {
-    *px = (static_cast<float>(i) + 0.5f - d.cx) * d.inv_r;
-    float rem = 1.0f - *px * *px - py2;
+  for (int i = i0; i <= i1; ++i) {
+    const float px = (static_cast<float>(i) + 0.5f - d.cx) * d.inv_r;
+    float rem = 1.0f - px * px - py2;
     if (rem < 0.0f) rem = 0.0f;  // span edge rounding
-    return fast_sqrt(rem);
-  };
-  if (step <= 1) {
-    for (int i = i0; i <= i1; ++i) {
-      float px;
-      const float pz = view_z(i, &px);
-      row[i] = tex[view_to_texel_fast<TW, TH>(v, px, py, pz)];
-    }
-    return;
-  }
-  float px;
-  float ua, va;
-  {
-    const float pz = view_z(i0, &px);
-    view_to_uv<TW, TH>(v, px, py, pz, &ua, &va);
-  }
-  for (int a = i0; a <= i1;) {
-    int b = a + step;
-    if (b > i1) b = i1;
-    const int len = b - a;
-    if (len == 0) {  // single pixel row, or the last pixel
-      row[a] = tex[latlon_texel_from_uv<TW, TH>(ua, va)];
-      break;
-    }
-    float ub, vb;
-    {
-      const float pz = view_z(b, &px);
-      view_to_uv<TW, TH>(v, px, py, pz, &ub, &vb);
-    }
-    float du = ub - ua;
-    if (du > 0.5f * TW) du -= TW;
-    if (du < -0.5f * TW) du += TW;
-    const float dv = vb - va;
-    const float inv_len = 1.0f / static_cast<float>(len);
-    const float rate_u = std::fabs(du) * inv_len;
-    const float rate_v = std::fabs(dv) * inv_len;
-    if (rate_u > max_rate || rate_v > max_rate) {
-      for (int i = a; i < b; ++i) {
-        const float pz = view_z(i, &px);
-        row[i] = tex[view_to_texel_fast<TW, TH>(v, px, py, pz)];
-      }
-    } else {
-      int32_t U = static_cast<int32_t>(ua * 65536.0f);
-      int32_t V = static_cast<int32_t>(va * 65536.0f);
-      const int32_t dU = static_cast<int32_t>(du * inv_len * 65536.0f);
-      const int32_t dV = static_cast<int32_t>(dv * inv_len * 65536.0f);
-      for (int i = a; i < b; ++i) {
-        const int iu = (U >> 16) & (TW - 1);
-        int iv = V >> 16;
-        if (iv > TH - 1) iv = TH - 1;
-        if (iv < 0) iv = 0;
-        row[i] = tex[iv * TW + iu];
-        U += dU;
-        V += dV;
-      }
-    }
-    if (b == i1) {
-      row[b] = tex[latlon_texel_from_uv<TW, TH>(ub, vb)];
-      break;
-    }
-    ua = ub;
-    va = vb;
-    a = b;
+    row[i] = tex[view_to_texel_fast<TW, TH>(v, px, py, fast_sqrt(rem))];
   }
 }
 

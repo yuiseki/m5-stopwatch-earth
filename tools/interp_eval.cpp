@@ -45,7 +45,7 @@ int main() {
         for (int j = 0; j < N; ++j) {
           int i0, i1;
           if (!disc.row_span(j, N, &i0, &i1)) continue;
-          render_row<TW, TH>(v, disc, j, i0, i1, 1, 0, tex.data(), exact.data());
+          render_row_exact<TW, TH>(v, disc, j, i0, i1, tex.data(), exact.data());
           evals += render_row_adaptive<TW, TH>(v, disc, j, i0, i1, seg, tol, tex.data(), approx.data());
           for (int i = i0; i <= i1; ++i) {
             ++px;
@@ -77,7 +77,7 @@ int main() {
         for (int j = 0; j < N; ++j) {
           int i0, i1;
           if (!disc.row_span(j, N, &i0, &i1)) continue;
-          render_row<TW, TH>(v, disc, j, i0, i1, 1, 0, tex.data(), exact.data());
+          render_row_exact<TW, TH>(v, disc, j, i0, i1, tex.data(), exact.data());
           evals += render_row_quadratic<TW, TH>(v, disc, j, i0, i1, seg, tol, tex.data(), approx.data());
           auto dist = [](uint32_t a, uint32_t b) {
             int du = std::abs(int(a % TW) - int(b % TW));

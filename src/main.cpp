@@ -195,7 +195,7 @@ void IRAM_ATTR bench_pass(const globe::View& v, const uint16_t* tex, int seg, ui
     int i0, i1;
     if (!g_disc.row_span(j, g_w, &i0, &i1)) continue;
     if (seg <= 1) {
-      globe::render_row<TW, TH>(v, g_disc, j, i0, i1, 1, 0.0f, tex, rowbuf);
+      globe::render_row_exact<TW, TH>(v, g_disc, j, i0, i1, tex, rowbuf);
     } else if (seg == kQuadSeg) {
       globe::render_row_quadratic<TW, TH>(v, g_disc, j, i0, i1, kQuadSeg, kQuadTol, tex, rowbuf);
     } else {

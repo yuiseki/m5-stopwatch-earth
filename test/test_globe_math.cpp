@@ -171,7 +171,7 @@ static void test_adaptive_rows_stay_within_one_texel() {
     for (int j = 0; j < n; ++j) {
       int i0, i1;
       if (!disc.row_span(j, n, &i0, &i1)) continue;
-      render_row<TW, TH>(v, disc, j, i0, i1, 1, 0, tex.data(), a.data());
+      render_row_exact<TW, TH>(v, disc, j, i0, i1, tex.data(), a.data());
       evals += render_row_adaptive<TW, TH>(v, disc, j, i0, i1, 32, 0.5f, tex.data(), b.data());
       for (int i = i0; i <= i1; ++i) {
         ++px;
@@ -196,7 +196,7 @@ static void test_adaptive_single_pixel_rows() {
   std::vector<uint32_t> a(468, 0xFFFFFFFFu), b(468, 0xFFFFFFFFu);
   for (int w = 0; w < 3; ++w) {
     const int i0 = 200, i1 = 200 + w;
-    render_row<TW, TH>(v, disc, 100, i0, i1, 1, 0, tex.data(), a.data());
+    render_row_exact<TW, TH>(v, disc, 100, i0, i1, tex.data(), a.data());
     render_row_adaptive<TW, TH>(v, disc, 100, i0, i1, 32, 0.5f, tex.data(), b.data());
     for (int i = i0; i <= i1; ++i) CHECK(a[i] == b[i], "width %d col %d: %u vs %u", w + 1, i, a[i], b[i]);
     CHECK(b[i1 + 1] == 0xFFFFFFFFu, "wrote past i1 for width %d", w + 1);
@@ -228,7 +228,7 @@ static void test_quadratic_rows_stay_within_one_pixel() {
     for (int j = 0; j < n; ++j) {
       int i0, i1;
       if (!disc.row_span(j, n, &i0, &i1)) continue;
-      render_row<TW, TH>(v, disc, j, i0, i1, 1, 0, tex.data(), a.data());
+      render_row_exact<TW, TH>(v, disc, j, i0, i1, tex.data(), a.data());
       evals += render_row_quadratic<TW, TH>(v, disc, j, i0, i1, 64, 0.25f, tex.data(), b.data());
       for (int i = i0; i <= i1; ++i) {
         ++px;
@@ -247,7 +247,7 @@ static void test_quadratic_rows_stay_within_one_pixel() {
   for (int w = 0; w < 3; ++w) {
     std::fill(a.begin(), a.end(), 0xFFFFFFFFu);
     std::fill(b.begin(), b.end(), 0xFFFFFFFFu);
-    render_row<TW, TH>(v, disc, 100, 200, 200 + w, 1, 0, tex.data(), a.data());
+    render_row_exact<TW, TH>(v, disc, 100, 200, 200 + w, tex.data(), a.data());
     render_row_quadratic<TW, TH>(v, disc, 100, 200, 200 + w, 64, 0.25f, tex.data(), b.data());
     for (int i = 200; i <= 200 + w; ++i) CHECK(a[i] == b[i], "width %d col %d", w + 1, i);
     CHECK(b[201 + w] == 0xFFFFFFFFu, "wrote past i1 for width %d", w + 1);
@@ -612,54 +612,42 @@ static void test_equator_reset_from_upside_down() {
   CHECK(std::fabs(rlon - clon) < 1e-3f, "keeps the facing longitude %g, got %g", clon / kDeg, rlon / kDeg);
 }
 
-// --- render_row: the exact reference renderer of the boot bench and tools/interp_eval.cpp ----
-//
-// Its step > 1 mode (linear between anchors, exact where u or v moves faster than max_rate
-// texels per pixel) is the first-cut design. A rate limit does not bound the bending of the
-// mapping, so it is only checked here for what it promises: with every rate above max_rate it
-// is the exact renderer, and it never writes outside [i0, i1].
+// --- render_row_exact: the reference renderer of the boot bench and tools/interp_eval.cpp ----
 
-static void test_render_row() {
-  const int N = 200;  // on this disc u moves more than 1.5 texels per pixel everywhere
+static void test_render_row_exact() {
+  const int N = 200;
   const Disc d = Disc::make(N, N);
   std::vector<uint32_t> tex(TW * TH);
   for (uint32_t i = 0; i < tex.size(); ++i) tex[i] = i;
-  std::vector<uint32_t> exact(N + 2), stepped(N + 2);
-  long far = 0, diff = 0, fallback_diff = 0, px = 0;
+  std::vector<uint32_t> row(N + 2);
+  long far = 0, diff = 0, px = 0;
   for (const View& v : {View::make(20 * kDeg, 135 * kDeg), View::make(70 * kDeg, 0)})
     for (int j = 0; j < N; ++j) {
       int i0, i1;
       if (!d.row_span(j, N, &i0, &i1)) continue;
-      std::fill(exact.begin(), exact.end(), 0xFFFFFFFFu);
-      std::fill(stepped.begin(), stepped.end(), 0xFFFFFFFFu);
-      render_row<TW, TH>(v, d, j, i0, i1, 1, 0.0f, tex.data(), exact.data());
-      render_row<TW, TH>(v, d, j, i0, i1, 8, 0.5f, tex.data(), stepped.data());
+      std::fill(row.begin(), row.end(), 0xFFFFFFFFu);
+      render_row_exact<TW, TH>(v, d, j, i0, i1, tex.data(), row.data());
       for (int i = i0; i <= i1; ++i) {
         float x, y, z;
         if (!d.pixel_to_view(i, j, &x, &y, &z)) continue;
         const uint32_t f = tex_fast(v, x, y, z);
-        // render_row takes z through fast_sqrt, pixel_to_view through std::sqrt: a pixel on a
-        // texel boundary may land one texel over.
-        const int du = std::abs((int)(exact[i] % TW) - (int)(f % TW));
-        const int dv = std::abs((int)(exact[i] / TW) - (int)(f / TW));
+        // render_row_exact takes z through fast_sqrt, pixel_to_view through std::sqrt: a pixel
+        // on a texel boundary may land one texel over.
+        const int du = std::abs((int)(row[i] % TW) - (int)(f % TW));
+        const int dv = std::abs((int)(row[i] / TW) - (int)(f / TW));
         far += std::min(du, TW - du) > 1 || dv > 1;
-        diff += exact[i] != f;
-        fallback_diff += stepped[i] != exact[i];
+        diff += row[i] != f;
         ++px;
       }
-      for (auto* b : {&exact, &stepped}) {
-        if (i0 > 0) CHECK((*b)[i0 - 1] == 0xFFFFFFFFu, "wrote before i0 on row %d", j);
-        CHECK((*b)[i1 + 1] == 0xFFFFFFFFu, "wrote past i1 on row %d", j);
-      }
+      if (i0 > 0) CHECK(row[i0 - 1] == 0xFFFFFFFFu, "wrote before i0 on row %d", j);
+      CHECK(row[i1 + 1] == 0xFFFFFFFFu, "wrote past i1 on row %d", j);
     }
-  CHECK(far == 0 && diff * 1000 < px, "step 1 vs view_to_texel_fast: %ld differ, %ld by more than a texel, of %ld",
+  CHECK(far == 0 && diff * 1000 < px, "render_row_exact vs view_to_texel_fast: %ld differ, %ld by more than a texel, of %ld",
         diff, far, px);
-  CHECK(fallback_diff == 0, "step 8 with every rate above max_rate should be exact, %ld pixels differ", fallback_diff);
 
-  // A single-pixel row.
-  std::fill(stepped.begin(), stepped.end(), 0xFFFFFFFFu);
-  render_row<TW, TH>(View::make(0, 0), d, 100, 50, 50, 8, 100.0f, tex.data(), stepped.data());
-  CHECK(stepped[50] != 0xFFFFFFFFu && stepped[49] == 0xFFFFFFFFu && stepped[51] == 0xFFFFFFFFu, "single pixel row");
+  std::fill(row.begin(), row.end(), 0xFFFFFFFFu);
+  render_row_exact<TW, TH>(View::make(0, 0), d, 100, 50, 50, tex.data(), row.data());
+  CHECK(row[50] != 0xFFFFFFFFu && row[49] == 0xFFFFFFFFu && row[51] == 0xFFFFFFFFu, "single pixel row");
 }
 
 int main() {
@@ -695,7 +683,7 @@ int main() {
   test_spin_turns_about_the_pole();
   test_orthonormalize_repairs_drift();
   test_equator_reset_from_upside_down();
-  test_render_row();
+  test_render_row_exact();
   if (g_failures) {
     std::printf("%d failure(s)\n", g_failures);
     return 1;
